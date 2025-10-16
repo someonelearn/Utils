@@ -150,7 +150,9 @@ class ImageClassificationPipeline:
             Processed batch with pixel_values and labels
         """
         images = [img.convert('RGB') for img in examples[image_col]]
-        inputs = image_processor(images, return_tensors='pt')
+        # Don't use return_tensors='pt' in batched processing
+        # Let the collate function handle tensor conversion
+        inputs = image_processor(images)
         inputs['labels'] = examples[label_col]
         return inputs
     
@@ -236,9 +238,29 @@ class ImageClassificationPipeline:
         Returns:
             Collated batch
         """
+        # Handle both tensor and list formats
+        pixel_values = []
+        labels = []
+        
+        for x in batch:
+            pv = x['pixel_values']
+            # If pixel_values is a list, convert to tensor
+            if isinstance(pv, list):
+                pv = torch.tensor(pv)
+            # If it's a tensor with batch dimension, squeeze it
+            elif pv.dim() > 3:
+                pv = pv.squeeze(0)
+            pixel_values.append(pv)
+            
+            lbl = x['labels']
+            # Handle labels that might be tensors or scalars
+            if isinstance(lbl, torch.Tensor):
+                lbl = lbl.item() if lbl.dim() == 0 else lbl[0].item()
+            labels.append(lbl)
+        
         return {
-            'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
-            'labels': torch.tensor([x['labels'] for x in batch])
+            'pixel_values': torch.stack(pixel_values),
+            'labels': torch.tensor(labels)
         }
     
     # ==================== STEP 6: Create Training Arguments ====================
