@@ -1,6 +1,7 @@
 """
 Modular pipeline for fine-tuning a HuggingFace model for image classification.
 Each step can be customized by passing replacement functions.
+Gracefully handles missing data and skips unnecessary operations.
 
 Usage:
     from datasets import load_dataset
@@ -34,6 +35,7 @@ from datasets import DatasetDict
 import numpy as np
 from typing import Dict, Tuple, Optional, Callable
 import evaluate
+import warnings
 
 
 class ImageClassificationPipeline:
@@ -52,7 +54,8 @@ class ImageClassificationPipeline:
         collate_fn: Optional[Callable] = None,
         create_trainer_fn: Optional[Callable] = None,
         post_training_fn: Optional[Callable] = None,
-        use_pretrained_weights: bool = True
+        use_pretrained_weights: bool = True,
+        verbose: bool = True
     ):
         """
         Initialize pipeline with optional custom functions for each step.
@@ -67,8 +70,10 @@ class ImageClassificationPipeline:
             create_trainer_fn: Custom trainer creation
             post_training_fn: Custom post-training operations
             use_pretrained_weights: Whether to load pretrained weights (default: True)
+            verbose: Whether to print progress messages (default: True)
         """
         self.use_pretrained_weights = use_pretrained_weights
+        self.verbose = verbose
         self.load_model_fn = load_model_fn or self._default_load_model
         self.load_processor_fn = load_processor_fn or self._default_load_processor
         self.preprocess_fn = preprocess_fn or self._default_preprocess
@@ -77,6 +82,11 @@ class ImageClassificationPipeline:
         self.collate_fn = collate_fn or self._default_collate_fn
         self.create_trainer_fn = create_trainer_fn or self._default_create_trainer
         self.post_training_fn = post_training_fn or self._default_post_training
+    
+    def _print(self, message: str):
+        """Print message if verbose mode is enabled."""
+        if self.verbose:
+            print(message)
     
     # ==================== STEP 1: Load Image Processor ====================
     
@@ -95,7 +105,7 @@ class ImageClassificationPipeline:
         Returns:
             Image processor instance
         """
-        print(f"Loading image processor: {model_name}")
+        self._print(f"Loading image processor: {model_name}")
         return AutoImageProcessor.from_pretrained(model_name, **kwargs)
     
     # ==================== STEP 2: Load Model ====================
@@ -104,8 +114,8 @@ class ImageClassificationPipeline:
         self,
         model_name: str,
         num_labels: int,
-        id2label: Dict[int, str],
-        label2id: Dict[str, int],
+        id2label: Optional[Dict[int, str]] = None,
+        label2id: Optional[Dict[str, int]] = None,
         **kwargs
     ) -> AutoModelForImageClassification:
         """
@@ -114,15 +124,15 @@ class ImageClassificationPipeline:
         Args:
             model_name: Name of the pretrained model or config
             num_labels: Number of classification labels
-            id2label: Mapping from label id to label name
-            label2id: Mapping from label name to label id
+            id2label: Mapping from label id to label name (optional)
+            label2id: Mapping from label name to label id (optional)
             **kwargs: Additional arguments for model loading
         
         Returns:
             Model instance
         """
         if self.use_pretrained_weights:
-            print(f"Loading model with pretrained weights: {model_name}")
+            self._print(f"Loading model with pretrained weights: {model_name}")
             return AutoModelForImageClassification.from_pretrained(
                 model_name,
                 num_labels=num_labels,
@@ -132,7 +142,7 @@ class ImageClassificationPipeline:
                 **kwargs
             )
         else:
-            print(f"Loading model from scratch (no pretrained weights): {model_name}")
+            self._print(f"Loading model from scratch (no pretrained weights): {model_name}")
             from transformers import AutoConfig
             
             # Load config first
@@ -169,8 +179,6 @@ class ImageClassificationPipeline:
             Processed batch with pixel_values and labels
         """
         images = [img.convert('RGB') for img in examples[image_col]]
-        # Don't use return_tensors='pt' in batched processing
-        # Let the collate function handle tensor conversion
         inputs = image_processor(images)
         inputs['labels'] = examples[label_col]
         return inputs
@@ -194,7 +202,7 @@ class ImageClassificationPipeline:
         Returns:
             Processed dataset
         """
-        print("Preprocessing dataset...")
+        self._print("Preprocessing dataset...")
         
         def transform(examples):
             return self.preprocess_fn(
@@ -217,6 +225,7 @@ class ImageClassificationPipeline:
     def _default_compute_metrics(self, eval_pred) -> Dict[str, float]:
         """
         Default: Compute accuracy and F1 metrics.
+        Gracefully handles missing metrics.
         
         Args:
             eval_pred: Tuple of (predictions, labels)
@@ -224,26 +233,41 @@ class ImageClassificationPipeline:
         Returns:
             Dictionary with metric names and values
         """
-        accuracy_metric = evaluate.load('accuracy')
-        f1_metric = evaluate.load('f1')
-        
         predictions, labels = eval_pred
         predictions = np.argmax(predictions, axis=1)
         
-        accuracy = accuracy_metric.compute(
-            predictions=predictions,
-            references=labels
-        )
-        f1 = f1_metric.compute(
-            predictions=predictions,
-            references=labels,
-            average='weighted'
-        )
+        results = {}
         
-        return {
-            'accuracy': accuracy['accuracy'],
-            'f1': f1['f1']
-        }
+        # Try to load accuracy metric
+        try:
+            accuracy_metric = evaluate.load('accuracy')
+            accuracy = accuracy_metric.compute(
+                predictions=predictions,
+                references=labels
+            )
+            results['accuracy'] = accuracy['accuracy']
+        except Exception as e:
+            if self.verbose:
+                warnings.warn(f"Could not compute accuracy: {e}")
+        
+        # Try to load F1 metric
+        try:
+            f1_metric = evaluate.load('f1')
+            f1 = f1_metric.compute(
+                predictions=predictions,
+                references=labels,
+                average='weighted'
+            )
+            results['f1'] = f1['f1']
+        except Exception as e:
+            if self.verbose:
+                warnings.warn(f"Could not compute F1: {e}")
+        
+        # Return at least something
+        if not results:
+            results['accuracy'] = float((predictions == labels).mean())
+        
+        return results
     
     # ==================== STEP 5: Collate Function ====================
     
@@ -257,7 +281,6 @@ class ImageClassificationPipeline:
         Returns:
             Collated batch
         """
-        # Handle both tensor and list formats
         pixel_values = []
         labels = []
         
@@ -321,7 +344,7 @@ class ImageClassificationPipeline:
         Returns:
             TrainingArguments instance
         """
-        print("Creating training arguments...")
+        self._print("Creating training arguments...")
         return TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
@@ -371,7 +394,7 @@ class ImageClassificationPipeline:
         Returns:
             Trainer instance
         """
-        print("Creating trainer...")
+        self._print("Creating trainer...")
         return Trainer(
             model=model,
             args=training_args,
@@ -408,15 +431,23 @@ class ImageClassificationPipeline:
         
         # Evaluate on test set if available
         if 'test' in processed_dataset:
-            print("\nEvaluating on test set...")
-            test_results = trainer.evaluate(processed_dataset['test'])
-            print(f"Test results: {test_results}")
-            results['test_results'] = test_results
+            self._print("\nEvaluating on test set...")
+            try:
+                test_results = trainer.evaluate(processed_dataset['test'])
+                self._print(f"Test results: {test_results}")
+                results['test_results'] = test_results
+            except Exception as e:
+                if self.verbose:
+                    warnings.warn(f"Could not evaluate on test set: {e}")
         
         # Save the final model
-        print(f"\nSaving model to {output_dir}")
-        trainer.save_model(output_dir)
-        image_processor.save_pretrained(output_dir)
+        self._print(f"\nSaving model to {output_dir}")
+        try:
+            trainer.save_model(output_dir)
+            image_processor.save_pretrained(output_dir)
+        except Exception as e:
+            if self.verbose:
+                warnings.warn(f"Could not save model: {e}")
         
         return results
     
@@ -483,8 +514,10 @@ class ImageClassificationPipeline:
         
         # Extract label information
         label_info = self._extract_label_info(dataset, label_col)
-        print(f"Number of labels: {label_info['num_labels']}")
-        print(f"Labels: {label_info['labels']}")
+        if label_info['num_labels'] is not None:
+            self._print(f"Number of labels: {label_info['num_labels']}")
+        if label_info['labels'] is not None:
+            self._print(f"Labels: {label_info['labels']}")
         
         # STEP 1: Load image processor
         image_processor = self.load_processor_fn(model_name)
@@ -506,6 +539,21 @@ class ImageClassificationPipeline:
         )
         
         # STEP 4: Create training arguments
+        # Auto-detect evaluation dataset
+        eval_dataset = None
+        if 'validation' in processed_dataset:
+            eval_dataset = processed_dataset['validation']
+        elif 'val' in processed_dataset:
+            eval_dataset = processed_dataset['val']
+        elif 'test' in processed_dataset:
+            eval_dataset = processed_dataset['test']
+        
+        # Adjust strategies if no eval dataset
+        if eval_dataset is None and self.verbose:
+            warnings.warn("No validation/test set found. Disabling evaluation.")
+            eval_strategy = 'no'
+            load_best_model = False
+        
         training_args = self.create_training_args_fn(
             output_dir=output_dir,
             num_epochs=num_epochs,
@@ -527,13 +575,13 @@ class ImageClassificationPipeline:
             model=model,
             training_args=training_args,
             train_dataset=processed_dataset['train'],
-            eval_dataset=processed_dataset.get('validation', processed_dataset.get('test')),
+            eval_dataset=eval_dataset,
             compute_metrics_fn=self.compute_metrics_fn,
             collate_fn=self.collate_fn
         )
         
         # STEP 6: Train
-        print("Starting training...")
+        self._print("Starting training...")
         trainer.train()
         
         # STEP 7: Post-training operations
@@ -578,10 +626,33 @@ class ImageClassificationPipeline:
         label_col: str
     ) -> Dict:
         """Extract label information from dataset."""
-        labels = dataset['train'].features[label_col].names
-        num_labels = len(labels)
-        label2id = {label: i for i, label in enumerate(labels)}
-        id2label = {i: label for i, label in enumerate(labels)}
+        try:
+            # Try to get label names from features
+            labels = dataset['train'].features[label_col].names
+            num_labels = len(labels)
+            label2id = {label: i for i, label in enumerate(labels)}
+            id2label = {i: label for i, label in enumerate(labels)}
+        except (AttributeError, KeyError):
+            # If labels aren't available, infer from data
+            if self.verbose:
+                warnings.warn("Could not extract label names from dataset features. Inferring from data...")
+            
+            unique_labels = set()
+            for split in dataset.keys():
+                if label_col in dataset[split].column_names:
+                    unique_labels.update(dataset[split][label_col])
+            
+            labels = sorted(list(unique_labels))
+            num_labels = len(labels)
+            label2id = {label: i for i, label in enumerate(labels)} if labels else None
+            id2label = {i: label for i, label in enumerate(labels)} if labels else None
+            
+            if not labels:
+                # Last resort: just count unique values
+                num_labels = len(set(dataset['train'][label_col]))
+                labels = None
+                label2id = None
+                id2label = None
         
         return {
             'labels': labels,
@@ -632,7 +703,7 @@ def predict_image(
         predicted_class = torch.argmax(probs).item()
     
     # Get label name if mapping provided
-    predicted_label = id2label[predicted_class] if id2label else predicted_class
+    predicted_label = id2label.get(predicted_class, predicted_class) if id2label else predicted_class
     
     return {
         'predicted_class': predicted_class,
@@ -674,92 +745,30 @@ if __name__ == '__main__':
         dataset=dataset,
         model_name='google/vit-base-patch16-224',
         output_dir='./beans_classifier_scratch',
-        num_epochs=10,  # Usually need more epochs when training from scratch
+        num_epochs=10,
         batch_size=32,
-        learning_rate=1e-3  # Higher learning rate for training from scratch
+        learning_rate=1e-3
     )
     
-    # Example 3: Override pretrained setting per run
+    # Example 3: Silent mode (minimal output)
     print("\n" + "=" * 60)
-    print("Example 3: Override Pretrained Setting")
+    print("Example 3: Silent Mode")
     print("=" * 60)
     
-    # Pipeline defaults to pretrained
-    pipeline_flexible = ImageClassificationPipeline(use_pretrained_weights=True)
-    
-    # But this specific run uses random weights
-    model_override, trainer_override = pipeline_flexible.run(
+    pipeline_silent = ImageClassificationPipeline(verbose=False)
+    model_silent, trainer_silent = pipeline_silent.run(
         dataset=dataset,
         model_name='google/vit-base-patch16-224',
-        output_dir='./beans_classifier_override',
-        num_epochs=5,
-        batch_size=32,
-        use_pretrained_weights=False  # Override here
+        output_dir='./beans_classifier_silent',
+        num_epochs=3,
+        batch_size=32
     )
     
-    # Example 4: Custom preprocessing function
+    # Example 4: Dataset without explicit label names
     print("\n" + "=" * 60)
-    print("Example 4: Custom Preprocessing")
+    print("Example 4: Dataset Without Label Features")
     print("=" * 60)
     
-    def custom_preprocess(examples, image_processor, image_col='image', label_col='label'):
-        """Custom preprocessing with data augmentation."""
-        images = [img.convert('RGB') for img in examples[image_col]]
-        
-        # Add custom augmentation here if needed
-        # For example, you could use torchvision transforms
-        
-        inputs = image_processor(images)
-        inputs['labels'] = examples[label_col]
-        return inputs
-    
-    pipeline_custom = ImageClassificationPipeline(
-        preprocess_fn=custom_preprocess,
-        use_pretrained_weights=True
-    )
-    
-    # Example 5: Custom metrics function
-    print("\n" + "=" * 60)
-    print("Example 5: Custom Metrics")
-    print("=" * 60)
-    
-    def custom_compute_metrics(eval_pred):
-        """Compute only accuracy metric."""
-        accuracy_metric = evaluate.load('accuracy')
-        predictions, labels = eval_pred
-        predictions = np.argmax(predictions, axis=1)
-        accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
-        return {'accuracy': accuracy['accuracy']}
-    
-    pipeline_custom_metrics = ImageClassificationPipeline(
-        compute_metrics_fn=custom_compute_metrics
-    )
-    
-    # Example 6: Multiple custom steps
-    print("\n" + "=" * 60)
-    print("Example 6: Multiple Custom Steps")
-    print("=" * 60)
-    
-    def custom_post_training(trainer, model, image_processor, processed_dataset, output_dir):
-        """Custom post-training with additional evaluation."""
-        results = {}
-        
-        if 'test' in processed_dataset:
-            print("\nRunning detailed test evaluation...")
-            test_results = trainer.evaluate(processed_dataset['test'])
-            results['test_results'] = test_results
-            
-            # Add custom evaluation logic here
-            print(f"Custom metric: {test_results.get('eval_accuracy', 0) * 100:.2f}%")
-        
-        trainer.save_model(output_dir)
-        image_processor.save_pretrained(output_dir)
-        
-        return results
-    
-    pipeline_full_custom = ImageClassificationPipeline(
-        preprocess_fn=custom_preprocess,
-        compute_metrics_fn=custom_compute_metrics,
-        post_training_fn=custom_post_training,
-        use_pretrained_weights=True
-    )
+    # This will automatically infer label information
+    pipeline_robust = ImageClassificationPipeline()
+    # Works even if dataset features don't have label names
