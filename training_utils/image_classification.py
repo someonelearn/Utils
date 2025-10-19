@@ -51,7 +51,8 @@ class ImageClassificationPipeline:
         compute_metrics_fn: Optional[Callable] = None,
         collate_fn: Optional[Callable] = None,
         create_trainer_fn: Optional[Callable] = None,
-        post_training_fn: Optional[Callable] = None
+        post_training_fn: Optional[Callable] = None,
+        use_pretrained_weights: bool = True
     ):
         """
         Initialize pipeline with optional custom functions for each step.
@@ -65,7 +66,9 @@ class ImageClassificationPipeline:
             collate_fn: Custom batch collation function
             create_trainer_fn: Custom trainer creation
             post_training_fn: Custom post-training operations
+            use_pretrained_weights: Whether to load pretrained weights (default: True)
         """
+        self.use_pretrained_weights = use_pretrained_weights
         self.load_model_fn = load_model_fn or self._default_load_model
         self.load_processor_fn = load_processor_fn or self._default_load_processor
         self.preprocess_fn = preprocess_fn or self._default_preprocess
@@ -106,10 +109,10 @@ class ImageClassificationPipeline:
         **kwargs
     ) -> AutoModelForImageClassification:
         """
-        Default: Load model from pretrained checkpoint.
+        Default: Load model from pretrained checkpoint or from scratch.
         
         Args:
-            model_name: Name of the pretrained model
+            model_name: Name of the pretrained model or config
             num_labels: Number of classification labels
             id2label: Mapping from label id to label name
             label2id: Mapping from label name to label id
@@ -118,15 +121,31 @@ class ImageClassificationPipeline:
         Returns:
             Model instance
         """
-        print(f"Loading model: {model_name}")
-        return AutoModelForImageClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels,
-            id2label=id2label,
-            label2id=label2id,
-            ignore_mismatched_sizes=True,
-            **kwargs
-        )
+        if self.use_pretrained_weights:
+            print(f"Loading model with pretrained weights: {model_name}")
+            return AutoModelForImageClassification.from_pretrained(
+                model_name,
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
+                ignore_mismatched_sizes=True,
+                **kwargs
+            )
+        else:
+            print(f"Loading model from scratch (no pretrained weights): {model_name}")
+            from transformers import AutoConfig
+            
+            # Load config first
+            config = AutoConfig.from_pretrained(
+                model_name,
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
+                **kwargs
+            )
+            
+            # Initialize model with random weights
+            return AutoModelForImageClassification.from_config(config)
     
     # ==================== STEP 3: Preprocess Dataset ====================
     
@@ -421,6 +440,7 @@ class ImageClassificationPipeline:
         seed: int = 42,
         fp16: bool = torch.cuda.is_available(),
         num_workers: int = 4,
+        use_pretrained_weights: Optional[bool] = None,
         **kwargs
     ) -> Tuple[AutoModelForImageClassification, Trainer]:
         """
@@ -443,11 +463,17 @@ class ImageClassificationPipeline:
             seed: Random seed
             fp16: Whether to use mixed precision
             num_workers: Number of data loading workers
+            use_pretrained_weights: Whether to use pretrained weights (overrides __init__ setting if provided)
             **kwargs: Additional arguments passed to create_training_args_fn
         
         Returns:
             Tuple of (trained_model, trainer)
         """
+        # Override use_pretrained_weights if explicitly provided
+        if use_pretrained_weights is not None:
+            original_setting = self.use_pretrained_weights
+            self.use_pretrained_weights = use_pretrained_weights
+        
         # Set seed for reproducibility
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -518,6 +544,10 @@ class ImageClassificationPipeline:
             processed_dataset,
             output_dir
         )
+        
+        # Restore original setting if it was overridden
+        if use_pretrained_weights is not None:
+            self.use_pretrained_weights = original_setting
         
         return model, trainer
     
@@ -617,9 +647,9 @@ def predict_image(
 if __name__ == '__main__':
     from datasets import load_dataset
     
-    # Example 1: Using default pipeline
+    # Example 1: Using default pipeline WITH pretrained weights
     print("=" * 60)
-    print("Example 1: Default Pipeline")
+    print("Example 1: Default Pipeline (WITH pretrained weights)")
     print("=" * 60)
     
     dataset = load_dataset('beans')
@@ -628,15 +658,48 @@ if __name__ == '__main__':
     model, trainer = pipeline.run(
         dataset=dataset,
         model_name='google/vit-base-patch16-224',
-        output_dir='./beans_classifier',
+        output_dir='./beans_classifier_pretrained',
         num_epochs=5,
         batch_size=32,
         learning_rate=2e-5
     )
     
-    # Example 2: Custom preprocessing function
+    # Example 2: Training from scratch WITHOUT pretrained weights
     print("\n" + "=" * 60)
-    print("Example 2: Custom Preprocessing")
+    print("Example 2: Training from Scratch (NO pretrained weights)")
+    print("=" * 60)
+    
+    pipeline_scratch = ImageClassificationPipeline(use_pretrained_weights=False)
+    model_scratch, trainer_scratch = pipeline_scratch.run(
+        dataset=dataset,
+        model_name='google/vit-base-patch16-224',
+        output_dir='./beans_classifier_scratch',
+        num_epochs=10,  # Usually need more epochs when training from scratch
+        batch_size=32,
+        learning_rate=1e-3  # Higher learning rate for training from scratch
+    )
+    
+    # Example 3: Override pretrained setting per run
+    print("\n" + "=" * 60)
+    print("Example 3: Override Pretrained Setting")
+    print("=" * 60)
+    
+    # Pipeline defaults to pretrained
+    pipeline_flexible = ImageClassificationPipeline(use_pretrained_weights=True)
+    
+    # But this specific run uses random weights
+    model_override, trainer_override = pipeline_flexible.run(
+        dataset=dataset,
+        model_name='google/vit-base-patch16-224',
+        output_dir='./beans_classifier_override',
+        num_epochs=5,
+        batch_size=32,
+        use_pretrained_weights=False  # Override here
+    )
+    
+    # Example 4: Custom preprocessing function
+    print("\n" + "=" * 60)
+    print("Example 4: Custom Preprocessing")
     print("=" * 60)
     
     def custom_preprocess(examples, image_processor, image_col='image', label_col='label'):
@@ -646,17 +709,18 @@ if __name__ == '__main__':
         # Add custom augmentation here if needed
         # For example, you could use torchvision transforms
         
-        inputs = image_processor(images, return_tensors='pt')
+        inputs = image_processor(images)
         inputs['labels'] = examples[label_col]
         return inputs
     
     pipeline_custom = ImageClassificationPipeline(
-        preprocess_fn=custom_preprocess
+        preprocess_fn=custom_preprocess,
+        use_pretrained_weights=True
     )
     
-    # Example 3: Custom metrics function
+    # Example 5: Custom metrics function
     print("\n" + "=" * 60)
-    print("Example 3: Custom Metrics")
+    print("Example 5: Custom Metrics")
     print("=" * 60)
     
     def custom_compute_metrics(eval_pred):
@@ -671,9 +735,9 @@ if __name__ == '__main__':
         compute_metrics_fn=custom_compute_metrics
     )
     
-    # Example 4: Multiple custom steps
+    # Example 6: Multiple custom steps
     print("\n" + "=" * 60)
-    print("Example 4: Multiple Custom Steps")
+    print("Example 6: Multiple Custom Steps")
     print("=" * 60)
     
     def custom_post_training(trainer, model, image_processor, processed_dataset, output_dir):
@@ -696,5 +760,6 @@ if __name__ == '__main__':
     pipeline_full_custom = ImageClassificationPipeline(
         preprocess_fn=custom_preprocess,
         compute_metrics_fn=custom_compute_metrics,
-        post_training_fn=custom_post_training
+        post_training_fn=custom_post_training,
+        use_pretrained_weights=True
     )
