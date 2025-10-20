@@ -484,7 +484,8 @@ class ImageClassificationPipeline:
         # Extract label information
         label_info = self._extract_label_info(dataset, label_col)
         print(f"Number of labels: {label_info['num_labels']}")
-        print(f"Labels: {label_info['labels']}")
+        if len(label_info['labels']) <= 20:  # Only print if reasonable number
+            print(f"Labels: {label_info['labels']}")
         
         # STEP 1: Load image processor
         image_processor = self.load_processor_fn(model_name)
@@ -506,6 +507,15 @@ class ImageClassificationPipeline:
         )
         
         # STEP 4: Create training arguments
+        # Determine if we have validation dataset
+        has_validation = 'validation' in dataset or 'test' in dataset
+        
+        # Adjust evaluation strategy if no validation set
+        if not has_validation and eval_strategy != 'no':
+            print("Warning: No validation set found. Setting eval_strategy='no'")
+            eval_strategy = 'no'
+            load_best_model = False
+        
         training_args = self.create_training_args_fn(
             output_dir=output_dir,
             num_epochs=num_epochs,
@@ -523,12 +533,14 @@ class ImageClassificationPipeline:
         )
         
         # STEP 5: Create trainer
+        eval_dataset = processed_dataset.get('validation') or processed_dataset.get('test')
+        
         trainer = self.create_trainer_fn(
             model=model,
             training_args=training_args,
             train_dataset=processed_dataset['train'],
-            eval_dataset=processed_dataset.get('validation', processed_dataset.get('test')),
-            compute_metrics_fn=self.compute_metrics_fn,
+            eval_dataset=eval_dataset,
+            compute_metrics_fn=self.compute_metrics_fn if eval_dataset else None,
             collate_fn=self.collate_fn
         )
         
@@ -571,14 +583,6 @@ class ImageClassificationPipeline:
         
         if label_col not in dataset['train'].column_names:
             raise ValueError(f"Dataset must contain '{label_col}' column")
-        
-        # Warn about missing splits
-        if 'validation' not in dataset and 'test' not in dataset:
-            print("WARNING: No validation or test split found. Training without evaluation.")
-        elif 'validation' not in dataset:
-            print("INFO: No validation split found. Will use test split for evaluation if available.")
-        
-        return True
     
     def _extract_label_info(
         self,
@@ -586,10 +590,30 @@ class ImageClassificationPipeline:
         label_col: str
     ) -> Dict:
         """Extract label information from dataset."""
-        labels = dataset['train'].features[label_col].names
-        num_labels = len(labels)
-        label2id = {label: i for i, label in enumerate(labels)}
-        id2label = {i: label for i, label in enumerate(labels)}
+        # Check if label column has ClassLabel feature with names
+        label_feature = dataset['train'].features.get(label_col)
+        
+        if hasattr(label_feature, 'names') and label_feature.names:
+            # Dataset has explicit label names
+            labels = label_feature.names
+            num_labels = len(labels)
+            label2id = {label: i for i, label in enumerate(labels)}
+            id2label = {i: label for i, label in enumerate(labels)}
+        else:
+            # Infer labels from unique values in the dataset
+            unique_labels = sorted(set(dataset['train'][label_col]))
+            num_labels = len(unique_labels)
+            
+            # If labels are already integers, use them directly
+            if all(isinstance(label, int) for label in unique_labels):
+                labels = [str(i) for i in range(num_labels)]
+                label2id = {str(i): i for i in range(num_labels)}
+                id2label = {i: str(i) for i in range(num_labels)}
+            else:
+                # Labels are strings or other types
+                labels = [str(label) for label in unique_labels]
+                label2id = {str(label): i for i, label in enumerate(unique_labels)}
+                id2label = {i: str(label) for i, label in enumerate(unique_labels)}
         
         return {
             'labels': labels,
