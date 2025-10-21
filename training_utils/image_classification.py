@@ -342,7 +342,7 @@ class ImageClassificationPipeline:
             dataloader_num_workers=num_workers,
             remove_unused_columns=False,
             push_to_hub=False,
-            report_to=['dvclive'],
+            report_to=['tensorboard'],
             **kwargs
         )
     
