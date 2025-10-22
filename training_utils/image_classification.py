@@ -159,13 +159,15 @@ class ImageClassificationPipeline:
         )
         
         return pipeline
-    
+
     def predict(
         self,
         image: Union[str, Path, 'PIL.Image.Image', List],
         return_all_scores: bool = False,
         top_k: Optional[int] = None,
-        return_encoded_labels: bool = False
+        return_encoded_labels: bool = False,
+        return_embeddings: bool = False,
+        track_gradients: bool = False
     ) -> Union[Dict, List[Dict]]:
         """
         Make predictions on one or more images.
@@ -175,10 +177,12 @@ class ImageClassificationPipeline:
             return_all_scores: If True, return probabilities for all classes
             top_k: If specified, return top k predictions
             return_encoded_labels: If True, return encoded integer labels instead of original labels
+            return_embeddings: If True, include model embeddings in the output
+            track_gradients: If True, enable gradient tracking (useful for grad-CAM, fine-tuning, etc.)
         
         Returns:
             Dictionary with prediction results (or list of dicts for multiple images)
-        
+            
         Example:
             # Single image
             result = pipeline.predict('cat.jpg')
@@ -192,6 +196,13 @@ class ImageClassificationPipeline:
             
             # Get encoded labels
             result = pipeline.predict('image.jpg', return_encoded_labels=True)
+            
+            # Extract embeddings
+            result = pipeline.predict('image.jpg', return_embeddings=True)
+            print(result['embeddings'].shape)
+            
+            # Enable gradient tracking for interpretability
+            result = pipeline.predict('image.jpg', track_gradients=True)
         """
         if self.model is None or self.image_processor is None:
             raise RuntimeError(
@@ -218,10 +229,48 @@ class ImageClassificationPipeline:
         inputs = self.image_processor(pil_images, return_tensors='pt')
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
+        # Set gradient tracking mode
+        if track_gradients:
+            self.model.train()  # Enable gradient tracking
+            outputs = self.model(**inputs, output_hidden_states=return_embeddings)
+        else:
+            self.model.eval()  # Disable gradient tracking
+            with torch.no_grad():
+                outputs = self.model(**inputs, output_hidden_states=return_embeddings)
+        
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=-1)
+        
+        # Extract embeddings if requested
+        embeddings = None
+        if return_embeddings:
+            # Get the last hidden state (before the classification head)
+            # This varies by model architecture, adjust as needed
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                # Take the last hidden state and apply pooling (e.g., CLS token or mean pooling)
+                last_hidden_state = outputs.hidden_states[-1]
+                
+                # For ViT-like models, use CLS token (first token)
+                if hasattr(self.model.config, 'model_type') and 'vit' in self.model.config.model_type.lower():
+                    embeddings = last_hidden_state[:, 0, :]
+                else:
+                    # For other models, use mean pooling
+                    embeddings = last_hidden_state.mean(dim=1)
+            else:
+                # Fallback: try to get pooler output or base model output
+                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+                    embeddings = outputs.pooler_output
+                elif hasattr(self.model, 'base_model'):
+                    # Run through base model only
+                    base_outputs = self.model.base_model(**inputs, output_hidden_states=True)
+                    if hasattr(base_outputs, 'pooler_output') and base_outputs.pooler_output is not None:
+                        embeddings = base_outputs.pooler_output
+                    elif hasattr(base_outputs, 'last_hidden_state'):
+                        embeddings = base_outputs.last_hidden_state.mean(dim=1)
+            
+            # Detach embeddings if gradients are not being tracked
+            if embeddings is not None and not track_gradients:
+                embeddings = embeddings.detach()
         
         # Format results
         results = []
@@ -233,7 +282,16 @@ class ImageClassificationPipeline:
                 top_k,
                 return_encoded_labels
             )
+            
+            # Add embeddings to result if requested
+            if return_embeddings and embeddings is not None:
+                result['embeddings'] = embeddings[i].cpu() if not track_gradients else embeddings[i]
+            
             results.append(result)
+        
+        # Reset model to eval mode if we changed it
+        if track_gradients:
+            self.model.eval()
         
         return results[0] if is_single else results
     
