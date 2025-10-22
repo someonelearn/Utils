@@ -245,28 +245,31 @@ class ImageClassificationPipeline:
         embeddings = None
         if return_embeddings:
             # Get the last hidden state (before the classification head)
-            # This varies by model architecture, adjust as needed
             if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-                # Take the last hidden state and apply pooling (e.g., CLS token or mean pooling)
+                # Extract the last hidden state
                 last_hidden_state = outputs.hidden_states[-1]
                 
-                # For ViT-like models, use CLS token (first token)
-                if hasattr(self.model.config, 'model_type') and 'vit' in self.model.config.model_type.lower():
+                # Handle different dimensionalities
+                num_dims = last_hidden_state.dim()
+                
+                if num_dims == 3:
+                    # Shape: [batch, sequence, features] - take first token (CLS token)
                     embeddings = last_hidden_state[:, 0, :]
+                elif num_dims == 4:
+                    # Shape: [batch, channels, height, width] - spatial average pooling
+                    embeddings = last_hidden_state.mean(dim=[2, 3])
+                elif num_dims > 4:
+                    raise ValueError(
+                        f"Unsupported hidden state dimensionality: {num_dims}. "
+                        f"Expected 3 or 4 dimensions, got shape {last_hidden_state.shape}"
+                    )
                 else:
-                    # For other models, use mean pooling
-                    embeddings = last_hidden_state.mean(dim=1)
+                    # num_dims < 3: keep as is (e.g., already pooled)
+                    embeddings = last_hidden_state
             else:
-                # Fallback: try to get pooler output or base model output
+                # Fallback: try to get pooler output
                 if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
                     embeddings = outputs.pooler_output
-                elif hasattr(self.model, 'base_model'):
-                    # Run through base model only
-                    base_outputs = self.model.base_model(**inputs, output_hidden_states=True)
-                    if hasattr(base_outputs, 'pooler_output') and base_outputs.pooler_output is not None:
-                        embeddings = base_outputs.pooler_output
-                    elif hasattr(base_outputs, 'last_hidden_state'):
-                        embeddings = base_outputs.last_hidden_state.mean(dim=1)
             
             # Detach embeddings if gradients are not being tracked
             if embeddings is not None and not track_gradients:
