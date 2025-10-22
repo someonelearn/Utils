@@ -223,7 +223,7 @@ class ImageClassificationPipeline:
     ) -> Dict:
         """Format prediction results."""
         predicted_class = torch.argmax(probs).item()
-        predicted_label = id2label.get(predicted_class, str(predicted_class))
+        predicted_label = id2label.get(predicted_class, predicted_class)
         confidence = probs[predicted_class].item()
         
         result = {
