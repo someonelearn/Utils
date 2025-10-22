@@ -1,6 +1,7 @@
 """
 Modular pipeline for fine-tuning a HuggingFace model for image classification.
 Each step can be customized by passing replacement functions.
+Supports label encoding for string/non-sequential labels using sklearn.
 
 Usage:
     from datasets import load_dataset
@@ -8,22 +9,20 @@ Usage:
     # Load your dataset (must have 'image' and 'label' columns)
     dataset = load_dataset('your_dataset_name')
     
-    # Use default pipeline
-    pipeline = ImageClassificationPipeline()
+    # Use default pipeline with automatic label encoding
+    pipeline = ImageClassificationPipeline(encode_labels=True)
     model, trainer = pipeline.run(dataset)
     
-    # Load trained pipeline later
+    # Load trained pipeline later (label encoder is automatically loaded)
     pipeline = ImageClassificationPipeline.from_pretrained('./path_to_saved_model')
     result = pipeline.predict('path/to/image.jpg')
     
-    # Or customize specific steps
-    def custom_preprocessing(examples, image_processor):
-        # Your custom preprocessing logic
-        pass
+    # Or provide custom label encoder
+    from sklearn.preprocessing import LabelEncoder
+    encoder = LabelEncoder()
+    encoder.fit(['cat', 'dog', 'bird'])
     
-    pipeline = ImageClassificationPipeline(
-        preprocess_fn=custom_preprocessing
-    )
+    pipeline = ImageClassificationPipeline(label_encoder=encoder)
     model, trainer = pipeline.run(dataset)
 """
 
@@ -40,12 +39,14 @@ from typing import Dict, Tuple, Optional, Callable, Union, List
 import evaluate
 from pathlib import Path
 import json
+import pickle
 
 
 class ImageClassificationPipeline:
     """
     Modular pipeline for image classification fine-tuning.
     Each step can be customized by passing replacement functions.
+    Supports label encoding for string/non-sequential labels.
     """
     
     def __init__(
@@ -60,7 +61,9 @@ class ImageClassificationPipeline:
         post_training_fn: Optional[Callable] = None,
         use_pretrained_weights: bool = True,
         model: Optional[AutoModelForImageClassification] = None,
-        image_processor: Optional[AutoImageProcessor] = None
+        image_processor: Optional[AutoImageProcessor] = None,
+        label_encoder: Optional['LabelEncoder'] = None,
+        encode_labels: bool = False
     ):
         """
         Initialize pipeline with optional custom functions for each step.
@@ -77,10 +80,14 @@ class ImageClassificationPipeline:
             use_pretrained_weights: Whether to load pretrained weights (default: True)
             model: Pre-loaded model instance (for from_pretrained)
             image_processor: Pre-loaded image processor instance (for from_pretrained)
+            label_encoder: Pre-fitted LabelEncoder instance
+            encode_labels: Whether to automatically create and use label encoder (default: False)
         """
         self.use_pretrained_weights = use_pretrained_weights
         self.model = model
         self.image_processor = image_processor
+        self.label_encoder = label_encoder
+        self.encode_labels = encode_labels
         
         self.load_model_fn = load_model_fn or self._default_load_model
         self.load_processor_fn = load_processor_fn or self._default_load_processor
@@ -134,10 +141,20 @@ class ImageClassificationPipeline:
         print(f"Model loaded on device: {device}")
         print(f"Number of labels: {model.config.num_labels}")
         
+        # Load label encoder if it exists
+        label_encoder = None
+        encoder_path = model_path / 'label_encoder.pkl'
+        if encoder_path.exists():
+            print("Loading label encoder...")
+            with open(encoder_path, 'rb') as f:
+                label_encoder = pickle.load(f)
+            print(f"Label encoder loaded with {len(label_encoder.classes_)} classes")
+        
         # Create pipeline instance
         pipeline = cls(
             model=model,
             image_processor=image_processor,
+            label_encoder=label_encoder,
             use_pretrained_weights=True
         )
         
@@ -147,7 +164,8 @@ class ImageClassificationPipeline:
         self,
         image: Union[str, Path, 'PIL.Image.Image', List],
         return_all_scores: bool = False,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        return_encoded_labels: bool = False
     ) -> Union[Dict, List[Dict]]:
         """
         Make predictions on one or more images.
@@ -156,6 +174,7 @@ class ImageClassificationPipeline:
             image: Single image (PIL Image or path) or list of images
             return_all_scores: If True, return probabilities for all classes
             top_k: If specified, return top k predictions
+            return_encoded_labels: If True, return encoded integer labels instead of original labels
         
         Returns:
             Dictionary with prediction results (or list of dicts for multiple images)
@@ -170,6 +189,9 @@ class ImageClassificationPipeline:
             
             # Top 3 predictions
             result = pipeline.predict('image.jpg', top_k=3)
+            
+            # Get encoded labels
+            result = pipeline.predict('image.jpg', return_encoded_labels=True)
         """
         if self.model is None or self.image_processor is None:
             raise RuntimeError(
@@ -208,7 +230,8 @@ class ImageClassificationPipeline:
                 prob,
                 self.model.config.id2label,
                 return_all_scores,
-                top_k
+                top_k,
+                return_encoded_labels
             )
             results.append(result)
         
@@ -219,12 +242,22 @@ class ImageClassificationPipeline:
         probs: torch.Tensor,
         id2label: Dict[int, str],
         return_all_scores: bool,
-        top_k: Optional[int]
+        top_k: Optional[int],
+        return_encoded_labels: bool
     ) -> Dict:
         """Format prediction results."""
         predicted_class = torch.argmax(probs).item()
         predicted_label = id2label.get(predicted_class, str(predicted_class))
         confidence = probs[predicted_class].item()
+        
+        # Decode label if encoder is available and not returning encoded labels
+        if self.label_encoder is not None and not return_encoded_labels:
+            try:
+                # The id2label contains encoded integers as strings
+                encoded_label = int(predicted_label) if isinstance(predicted_label, str) else predicted_label
+                predicted_label = self.label_encoder.inverse_transform([encoded_label])[0]
+            except (ValueError, IndexError):
+                pass  # Keep original label if decoding fails
         
         result = {
             'predicted_class': predicted_class,
@@ -235,25 +268,48 @@ class ImageClassificationPipeline:
         if top_k is not None:
             # Get top k predictions
             top_probs, top_indices = torch.topk(probs, min(top_k, len(probs)))
-            result['top_k'] = [
-                {
-                    'label': id2label.get(idx.item(), str(idx.item())),
+            top_k_results = []
+            
+            for prob, idx in zip(top_probs, top_indices):
+                label = id2label.get(idx.item(), str(idx.item()))
+                
+                # Decode label if encoder is available
+                if self.label_encoder is not None and not return_encoded_labels:
+                    try:
+                        encoded_label = int(label) if isinstance(label, str) else label
+                        label = self.label_encoder.inverse_transform([encoded_label])[0]
+                    except (ValueError, IndexError):
+                        pass
+                
+                top_k_results.append({
+                    'label': label,
                     'score': prob.item()
-                }
-                for prob, idx in zip(top_probs, top_indices)
-            ]
+                })
+            
+            result['top_k'] = top_k_results
         
         if return_all_scores:
-            result['all_scores'] = {
-                id2label.get(i, str(i)): prob.item()
-                for i, prob in enumerate(probs)
-            }
+            all_scores = {}
+            for i, prob in enumerate(probs):
+                label = id2label.get(i, str(i))
+                
+                # Decode label if encoder is available
+                if self.label_encoder is not None and not return_encoded_labels:
+                    try:
+                        encoded_label = int(label) if isinstance(label, str) else label
+                        label = self.label_encoder.inverse_transform([encoded_label])[0]
+                    except (ValueError, IndexError):
+                        pass
+                
+                all_scores[label] = prob.item()
+            
+            result['all_scores'] = all_scores
         
         return result
     
     def save(self, output_dir: Union[str, Path]):
         """
-        Save the current model and processor.
+        Save the current model, processor, and label encoder.
         
         Args:
             output_dir: Directory to save to
@@ -270,6 +326,13 @@ class ImageClassificationPipeline:
         print(f"Saving model to: {output_dir}")
         self.model.save_pretrained(output_dir)
         self.image_processor.save_pretrained(output_dir)
+        
+        # Save label encoder if it exists
+        if self.label_encoder is not None:
+            encoder_path = output_dir / 'label_encoder.pkl'
+            print(f"Saving label encoder to: {encoder_path}")
+            with open(encoder_path, 'wb') as f:
+                pickle.dump(self.label_encoder, f)
         
         print("Model and processor saved successfully")
     
@@ -605,7 +668,75 @@ class ImageClassificationPipeline:
         trainer.save_model(output_dir)
         image_processor.save_pretrained(output_dir)
         
+        # Save label encoder if it exists
+        if self.label_encoder is not None:
+            encoder_path = Path(output_dir) / 'label_encoder.pkl'
+            print(f"Saving label encoder to: {encoder_path}")
+            with open(encoder_path, 'wb') as f:
+                pickle.dump(self.label_encoder, f)
+        
         return results
+    
+    # ==================== Label Encoding Utilities ====================
+    
+    def _create_label_encoder(
+        self,
+        dataset: DatasetDict,
+        label_col: str = 'label'
+    ):
+        """
+        Create and fit a label encoder on the dataset labels.
+        
+        Args:
+            dataset: HuggingFace dataset
+            label_col: Name of label column
+        """
+        from sklearn.preprocessing import LabelEncoder
+        
+        # Get all unique labels from train split
+        all_labels = dataset['train'][label_col]
+        
+        # Create and fit encoder
+        self.label_encoder = LabelEncoder()
+        self.label_encoder.fit(all_labels)
+        
+        print(f"Label encoder created with {len(self.label_encoder.classes_)} classes")
+        print(f"Classes: {self.label_encoder.classes_[:20]}")  # Show first 20
+        if len(self.label_encoder.classes_) > 20:
+            print(f"... and {len(self.label_encoder.classes_) - 20} more")
+    
+    def _encode_dataset_labels(
+        self,
+        dataset: DatasetDict,
+        label_col: str = 'label'
+    ) -> DatasetDict:
+        """
+        Encode string labels to integers using the label encoder.
+        
+        Args:
+            dataset: HuggingFace dataset
+            label_col: Name of label column
+        
+        Returns:
+            Dataset with encoded labels
+        """
+        if self.label_encoder is None:
+            raise RuntimeError("Label encoder not initialized. Call _create_label_encoder first.")
+        
+        print("Encoding labels...")
+        
+        def encode_labels(examples):
+            labels = examples[label_col]
+            encoded = self.label_encoder.transform(labels)
+            examples[label_col] = encoded.tolist()
+            return examples
+        
+        encoded_dataset = dataset.map(
+            encode_labels,
+            batched=True
+        )
+        
+        return encoded_dataset
     
     # ==================== MAIN PIPELINE ====================
     
@@ -664,6 +795,20 @@ class ImageClassificationPipeline:
         np.random.seed(seed)
         
         self._validate_dataset(dataset, image_col, label_col)
+        
+        # Check if labels need encoding
+        sample_label = dataset['train'][label_col][0]
+        labels_are_strings = isinstance(sample_label, str)
+        
+        # Create label encoder if needed
+        if (self.encode_labels or self.label_encoder is not None) and labels_are_strings:
+            if self.label_encoder is None:
+                print("Creating label encoder for string labels...")
+                self._create_label_encoder(dataset, label_col)
+            
+            # Encode the dataset labels
+            dataset = self._encode_dataset_labels(dataset, label_col)
+            print("Labels encoded successfully")
         
         label_info = self._extract_label_info(dataset, label_col)
         print(f"Number of labels: {label_info['num_labels']}")
@@ -804,7 +949,8 @@ def predict_image(
     model,
     image_processor,
     image,
-    id2label: Optional[Dict[int, str]] = None
+    id2label: Optional[Dict[int, str]] = None,
+    label_encoder: Optional['LabelEncoder'] = None
 ) -> Dict[str, any]:
     """
     Make a prediction on a single image (backward compatible function).
@@ -814,6 +960,7 @@ def predict_image(
         image_processor: Image processor
         image: PIL Image or path to image
         id2label: Mapping from label id to label name
+        label_encoder: Optional label encoder to decode predictions
     
     Returns:
         Dictionary with predicted label and confidence scores
@@ -835,6 +982,14 @@ def predict_image(
     
     predicted_label = id2label[predicted_class] if id2label else predicted_class
     
+    # Decode label if encoder is provided
+    if label_encoder is not None:
+        try:
+            encoded_label = int(predicted_label) if isinstance(predicted_label, str) else predicted_label
+            predicted_label = label_encoder.inverse_transform([encoded_label])[0]
+        except (ValueError, IndexError):
+            pass
+    
     return {
         'predicted_class': predicted_class,
         'predicted_label': predicted_label,
@@ -846,17 +1001,107 @@ def predict_image(
 # ==================== Example Usage ====================
 
 if __name__ == '__main__':
-    from datasets import load_dataset
+    from datasets import load_dataset, Dataset, DatasetDict
+    import pandas as pd
     
-    # Example 1: Training and saving
+    # Example 1: Training with string labels and automatic encoding
     print("=" * 60)
-    print("Example 1: Train and Save Model")
+    print("Example 1: Train with String Labels (Auto-Encoding)")
+    print("=" * 60)
+    
+    # Create a custom dataset with string labels
+    train_data = {
+        'image': [...],  # Your PIL images here
+        'label': ['cat', 'dog', 'bird', 'cat', 'dog', 'bird'] * 100
+    }
+    test_data = {
+        'image': [...],  # Your PIL images here
+        'label': ['cat', 'dog', 'bird'] * 20
+    }
+    
+    custom_dataset = DatasetDict({
+        'train': Dataset.from_dict(train_data),
+        'test': Dataset.from_dict(test_data)
+    })
+    
+    # Pipeline will automatically encode string labels
+    pipeline = ImageClassificationPipeline(encode_labels=True)
+    model, trainer = pipeline.run(
+        dataset=custom_dataset,
+        model_name='google/vit-base-patch16-224',
+        output_dir='./string_label_classifier',
+        num_epochs=3,
+        batch_size=32,
+        learning_rate=2e-5
+    )
+    
+    # Save the model (label encoder is saved automatically)
+    pipeline.save('./string_label_classifier')
+    
+    # Example 2: Load and predict with encoded labels
+    print("\n" + "=" * 60)
+    print("Example 2: Load Model and Make Predictions")
+    print("=" * 60)
+    
+    # Load the trained pipeline (label encoder loaded automatically)
+    loaded_pipeline = ImageClassificationPipeline.from_pretrained('./string_label_classifier')
+    
+    # Make predictions (labels are decoded automatically)
+    result = loaded_pipeline.predict(custom_dataset['test'][0]['image'])
+    print(f"\nPrediction: {result['predicted_label']}")  # Returns 'cat', 'dog', or 'bird'
+    print(f"Confidence: {result['confidence']:.4f}")
+    
+    # Get top-3 predictions with decoded labels
+    result_top3 = loaded_pipeline.predict(
+        custom_dataset['test'][0]['image'],
+        top_k=3
+    )
+    print("\nTop 3 predictions:")
+    for pred in result_top3['top_k']:
+        print(f"  {pred['label']}: {pred['score']:.4f}")
+    
+    # Get encoded labels if needed
+    result_encoded = loaded_pipeline.predict(
+        custom_dataset['test'][0]['image'],
+        return_encoded_labels=True
+    )
+    print(f"\nEncoded prediction: {result_encoded['predicted_label']}")  # Returns 0, 1, or 2
+    
+    # Example 3: Using pre-fitted label encoder
+    print("\n" + "=" * 60)
+    print("Example 3: Using Pre-Fitted Label Encoder")
+    print("=" * 60)
+    
+    from sklearn.preprocessing import LabelEncoder
+    
+    # Create and fit your own label encoder
+    custom_encoder = LabelEncoder()
+    custom_encoder.fit(['cat', 'dog', 'bird', 'fish', 'horse'])
+    
+    # Use the custom encoder
+    pipeline_custom = ImageClassificationPipeline(
+        label_encoder=custom_encoder
+    )
+    
+    # The pipeline will use your encoder
+    model, trainer = pipeline_custom.run(
+        dataset=custom_dataset,
+        model_name='google/vit-base-patch16-224',
+        output_dir='./custom_encoder_classifier',
+        num_epochs=2,
+        batch_size=32
+    )
+    
+    # Example 4: Standard beans dataset (no encoding needed)
+    print("\n" + "=" * 60)
+    print("Example 4: Standard Dataset (No Encoding)")
     print("=" * 60)
     
     dataset = load_dataset('beans')
     
-    pipeline = ImageClassificationPipeline()
-    model, trainer = pipeline.run(
+    # Don't use encoding for datasets with integer labels
+    pipeline_standard = ImageClassificationPipeline(encode_labels=False)
+    model, trainer = pipeline_standard.run(
         dataset=dataset,
         model_name='google/vit-base-patch16-224',
         output_dir='./beans_classifier',
@@ -865,106 +1110,66 @@ if __name__ == '__main__':
         learning_rate=2e-5
     )
     
-    # Save the model
-    pipeline.save('./beans_classifier')
-    
-    # Example 2: Loading and using a trained model
+    # Example 5: Batch predictions with string labels
     print("\n" + "=" * 60)
-    print("Example 2: Load Trained Model and Make Predictions")
+    print("Example 5: Batch Predictions with Decoded Labels")
     print("=" * 60)
     
-    # Load the trained pipeline
-    loaded_pipeline = ImageClassificationPipeline.from_pretrained('./beans_classifier')
-    
-    # Make predictions on a single image
-    result = loaded_pipeline.predict(dataset['test'][0]['image'])
-    print(f"\nPrediction: {result['predicted_label']}")
-    print(f"Confidence: {result['confidence']:.4f}")
-    
-    # Make predictions with top-3 results
-    result_top3 = loaded_pipeline.predict(
-        dataset['test'][0]['image'],
-        top_k=3
-    )
-    print("\nTop 3 predictions:")
-    for pred in result_top3['top_k']:
-        print(f"  {pred['label']}: {pred['score']:.4f}")
+    loaded_pipeline = ImageClassificationPipeline.from_pretrained('./string_label_classifier')
     
     # Batch predictions
-    test_images = [dataset['test'][i]['image'] for i in range(5)]
+    test_images = [custom_dataset['test'][i]['image'] for i in range(5)]
     batch_results = loaded_pipeline.predict(test_images)
+    
     print("\nBatch predictions:")
     for i, result in enumerate(batch_results):
         print(f"  Image {i}: {result['predicted_label']} ({result['confidence']:.4f})")
     
-    # Example 3: Load model on specific device
+    # Example 6: Get all scores with decoded labels
     print("\n" + "=" * 60)
-    print("Example 3: Load Model on Specific Device")
+    print("Example 6: All Scores with Decoded Labels")
     print("=" * 60)
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    pipeline_device = ImageClassificationPipeline.from_pretrained(
-        './beans_classifier',
-        device=device
+    result_all = loaded_pipeline.predict(
+        custom_dataset['test'][0]['image'],
+        return_all_scores=True
     )
-    print(f"Model loaded on: {device}")
     
-    # Example 4: Custom pipeline with saving
+    print("\nAll class probabilities:")
+    for label, score in result_all['all_scores'].items():
+        print(f"  {label}: {score:.4f}")
+    
+    # Example 7: Using backward compatible predict_image function
     print("\n" + "=" * 60)
-    print("Example 4: Custom Pipeline with Save/Load")
+    print("Example 7: Backward Compatible Function")
     print("=" * 60)
     
-    def custom_compute_metrics(eval_pred):
-        """Compute only accuracy metric."""
-        accuracy_metric = evaluate.load('accuracy')
-        predictions, labels = eval_pred
-        predictions = np.argmax(predictions, axis=1)
-        accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
-        return {'accuracy': accuracy['accuracy']}
-    
-    # Train with custom metrics
-    custom_pipeline = ImageClassificationPipeline(
-        compute_metrics_fn=custom_compute_metrics
-    )
-    model, trainer = custom_pipeline.run(
-        dataset=dataset,
-        model_name='google/vit-base-patch16-224',
-        output_dir='./beans_custom',
-        num_epochs=2,
-        batch_size=32
+    result = predict_image(
+        model=loaded_pipeline.model,
+        image_processor=loaded_pipeline.image_processor,
+        image=custom_dataset['test'][0]['image'],
+        id2label=loaded_pipeline.model.config.id2label,
+        label_encoder=loaded_pipeline.label_encoder
     )
     
-    # Make predictions immediately after training
-    print("\nMaking predictions with trained pipeline...")
-    result = custom_pipeline.predict(dataset['test'][0]['image'])
-    print(f"Prediction: {result['predicted_label']} ({result['confidence']:.4f})")
+    print(f"Prediction: {result['predicted_label']}")
+    print(f"Confidence: {result['confidence']:.4f}")
     
-    # Save and reload
-    custom_pipeline.save('./beans_custom_saved')
-    reloaded = ImageClassificationPipeline.from_pretrained('./beans_custom_saved')
-    
-    result = reloaded.predict(dataset['test'][0]['image'])
-    print(f"Prediction after reload: {result['predicted_label']} ({result['confidence']:.4f})")
-    
-    # Example 5: Training from scratch, then loading
+    # Example 8: Accessing the label encoder directly
     print("\n" + "=" * 60)
-    print("Example 5: Train from Scratch and Load")
+    print("Example 8: Direct Label Encoder Access")
     print("=" * 60)
     
-    scratch_pipeline = ImageClassificationPipeline(use_pretrained_weights=False)
-    model_scratch, trainer_scratch = scratch_pipeline.run(
-        dataset=dataset,
-        model_name='google/vit-base-patch16-224',
-        output_dir='./beans_scratch',
-        num_epochs=2,
-        batch_size=32,
-        learning_rate=1e-3
-    )
-    
-    # Load the from-scratch model
-    loaded_scratch = ImageClassificationPipeline.from_pretrained('./beans_scratch')
-    result = loaded_scratch.predict(dataset['test'][0]['image'], top_k=3)
-    print(f"\nTop prediction: {result['predicted_label']}")
+    if loaded_pipeline.label_encoder is not None:
+        print(f"Label classes: {loaded_pipeline.label_encoder.classes_}")
+        
+        # Encode labels manually
+        encoded = loaded_pipeline.label_encoder.transform(['cat', 'dog'])
+        print(f"Encoded ['cat', 'dog']: {encoded}")
+        
+        # Decode labels manually
+        decoded = loaded_pipeline.label_encoder.inverse_transform([0, 1])
+        print(f"Decoded [0, 1]: {decoded}")
     
     print("\n" + "=" * 60)
     print("All examples completed!")
