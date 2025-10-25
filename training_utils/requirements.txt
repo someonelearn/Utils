@@ -1,3 +1,1 @@
-transformers
-evaluate
-wandb
+transformers==4.45.0
