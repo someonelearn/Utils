@@ -1,2 +1,9 @@
-wandb
+torch
+transformers
+datasets
+numpy
+typing
 evaluate
+pathlib
+json
+pickle
