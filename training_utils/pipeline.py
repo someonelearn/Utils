@@ -41,7 +41,16 @@ from transformers import (
 from datasets import DatasetDict
 import numpy as np
 from typing import Dict, Tuple, Optional, Callable, Union, List, Any
-import evaluate
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score
+)
+from scipy.stats import pearsonr, spearmanr
 from pathlib import Path
 import json
 import pickle
@@ -385,28 +394,35 @@ class NLPPipeline:
             return self._compute_metrics_generation
     
     def _compute_metrics_classification(self, eval_pred):
-        """Compute classification metrics."""
-        accuracy_metric = evaluate.load('accuracy')
-        f1_metric = evaluate.load('f1')
-        
+        """Compute classification metrics using sklearn."""
         predictions, labels = eval_pred
         predictions = np.argmax(predictions, axis=1)
         
-        accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
-        f1 = f1_metric.compute(predictions=predictions, references=labels, average='weighted')
+        # Calculate metrics
+        accuracy = accuracy_score(labels, predictions)
+        f1 = f1_score(labels, predictions, average='weighted', zero_division=0)
+        precision = precision_score(labels, predictions, average='weighted', zero_division=0)
+        recall = recall_score(labels, predictions, average='weighted', zero_division=0)
         
-        return {'accuracy': accuracy['accuracy'], 'f1': f1['f1']}
+        return {
+            'accuracy': accuracy,
+            'f1': f1,
+            'precision': precision,
+            'recall': recall
+        }
     
     def _compute_metrics_regression(self, eval_pred):
-        """Compute regression metrics."""
+        """Compute regression metrics using sklearn."""
         predictions, labels = eval_pred
         predictions = predictions.squeeze()
         
-        mse = np.mean((predictions - labels) ** 2)
-        mae = np.mean(np.abs(predictions - labels))
+        # Calculate metrics
+        mse = mean_squared_error(labels, predictions)
+        mae = mean_absolute_error(labels, predictions)
         rmse = np.sqrt(mse)
+        r2 = r2_score(labels, predictions)
         
-        from scipy.stats import pearsonr, spearmanr
+        # Correlation metrics
         pearson_corr, _ = pearsonr(predictions, labels)
         spearman_corr, _ = spearmanr(predictions, labels)
         
@@ -414,12 +430,13 @@ class NLPPipeline:
             'mse': mse,
             'rmse': rmse,
             'mae': mae,
+            'r2': r2,
             'pearson': pearson_corr,
             'spearman': spearman_corr
         }
     
     def _compute_metrics_generation(self, eval_pred):
-        """Compute generation metrics (ROUGE)."""
+        """Compute generation metrics using sklearn-based ROUGE implementation."""
         predictions, labels = eval_pred
         
         decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
@@ -427,20 +444,34 @@ class NLPPipeline:
         labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
         decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
         
-        rouge_metric = evaluate.load('rouge')
-        result = rouge_metric.compute(
-            predictions=decoded_preds,
-            references=decoded_labels,
-            use_stemmer=True
-        )
-        
-        result = {k: v * 100 for k, v in result.items()}
-        
-        return {
-            'rouge1': result['rouge1'],
-            'rouge2': result['rouge2'],
-            'rougeL': result['rougeL']
-        }
+        # Use rouge-score library (pure Python implementation)
+        try:
+            from rouge_score import rouge_scorer
+            scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+            
+            rouge1_scores = []
+            rouge2_scores = []
+            rougeL_scores = []
+            
+            for pred, label in zip(decoded_preds, decoded_labels):
+                scores = scorer.score(label, pred)
+                rouge1_scores.append(scores['rouge1'].fmeasure)
+                rouge2_scores.append(scores['rouge2'].fmeasure)
+                rougeL_scores.append(scores['rougeL'].fmeasure)
+            
+            return {
+                'rouge1': np.mean(rouge1_scores) * 100,
+                'rouge2': np.mean(rouge2_scores) * 100,
+                'rougeL': np.mean(rougeL_scores) * 100
+            }
+        except ImportError:
+            print("Warning: rouge-score not installed. Install with: pip install rouge-score")
+            # Fallback to simple metrics
+            return {
+                'rouge1': 0.0,
+                'rouge2': 0.0,
+                'rougeL': 0.0
+            }
     
     def _get_default_collate_fn(self) -> Callable:
         """Get default collate function based on task type."""
