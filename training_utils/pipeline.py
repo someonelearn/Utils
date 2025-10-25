@@ -265,28 +265,47 @@ class NLPPipeline:
         """Load classification/regression model."""
         if self.task_type == 'regression':
             num_labels = 1
+            # For regression, don't pass id2label and label2id
+            id2label = None
+            label2id = None
         
         if self.use_pretrained_weights:
             print(f"Loading {self.task_type} model: {model_name}")
+            
+            # Build kwargs conditionally
+            model_kwargs = {
+                'num_labels': num_labels,
+                'problem_type': self.problem_type,
+                'ignore_mismatched_sizes': True,
+                **kwargs
+            }
+            
+            # Only add label mappings if they exist (not for regression)
+            if id2label is not None:
+                model_kwargs['id2label'] = id2label
+            if label2id is not None:
+                model_kwargs['label2id'] = label2id
+            
             return AutoModelForSequenceClassification.from_pretrained(
                 model_name,
-                num_labels=num_labels,
-                id2label=id2label,
-                label2id=label2id,
-                problem_type=self.problem_type,
-                ignore_mismatched_sizes=True,
-                **kwargs
+                **model_kwargs
             )
         else:
             from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(
-                model_name,
-                num_labels=num_labels,
-                id2label=id2label,
-                label2id=label2id,
-                problem_type=self.problem_type,
+            
+            config_kwargs = {
+                'num_labels': num_labels,
+                'problem_type': self.problem_type,
                 **kwargs
-            )
+            }
+            
+            # Only add label mappings if they exist (not for regression)
+            if id2label is not None:
+                config_kwargs['id2label'] = id2label
+            if label2id is not None:
+                config_kwargs['label2id'] = label2id
+            
+            config = AutoConfig.from_pretrained(model_name, **config_kwargs)
             return AutoModelForSequenceClassification.from_config(config)
     
     def _load_generation_model(self, model_name: str, **kwargs):
