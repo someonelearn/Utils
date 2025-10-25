@@ -342,7 +342,7 @@ class NLPPipeline:
         tokenizer: AutoTokenizer,
         text_col: str = 'text',
         label_col: str = 'label',
-        max_length: int = 128,
+        max_length: int = 512,
         **kwargs
     ) -> Dict:
         """Tokenize text for classification."""
@@ -361,7 +361,7 @@ class NLPPipeline:
         tokenizer: AutoTokenizer,
         text_col: str = 'text',
         label_col: str = 'label',
-        max_length: int = 128,
+        max_length: int = 512,
         **kwargs
     ) -> Dict:
         """Tokenize text for regression."""
@@ -371,8 +371,12 @@ class NLPPipeline:
             truncation=True,
             max_length=max_length
         )
-        # Ensure labels are floats
-        tokenized['labels'] = [float(label) for label in examples[label_col]]
+        # Ensure labels are floats - handle both single values and lists
+        labels = examples[label_col]
+        if isinstance(labels, (list, tuple)):
+            tokenized['labels'] = [float(label) for label in labels]
+        else:
+            tokenized['labels'] = float(labels)
         return tokenized
     
     def _preprocess_generation(
@@ -381,7 +385,7 @@ class NLPPipeline:
         tokenizer: AutoTokenizer,
         input_col: str = 'input',
         target_col: str = 'target',
-        max_input_length: int = 128,
+        max_input_length: int = 512,
         max_target_length: int = 128,
         **kwargs
     ) -> Dict:
@@ -501,7 +505,13 @@ class NLPPipeline:
     
     def _collate_classification(self, batch):
         """Collate function for classification/regression."""
-        return DataCollatorWithPadding(self.tokenizer)(batch)
+        collated = DataCollatorWithPadding(self.tokenizer)(batch)
+        
+        # For regression, ensure labels are float tensors
+        if self.task_type == 'regression' and 'labels' in collated:
+            collated['labels'] = collated['labels'].float()
+        
+        return collated
     
     def _collate_generation(self, batch):
         """Collate function for generation."""
@@ -740,7 +750,7 @@ class NLPPipeline:
         top_k: Optional[int] = None,
         return_encoded_labels: bool = False,
         return_embeddings: bool = False,
-        max_length: int = 128,
+        max_length: int = 512,
         **kwargs
     ) -> Union[Dict, List[Dict]]:
         """
@@ -1012,8 +1022,8 @@ class NLPPipeline:
         label_col: str = 'label',
         input_col: str = 'input',
         target_col: str = 'target',
-        max_length: int = 128,
-        max_input_length: int = 128,
+        max_length: int = 512,
+        max_input_length: int = 512,
         max_target_length: int = 128,
         num_epochs: int = 3,
         batch_size: int = 16,
@@ -1391,7 +1401,7 @@ if __name__ == '__main__':
     }
     
     # Custom preprocessing for multi-label
-    def multilabel_preprocess(examples, tokenizer, text_col='text', label_col='label', max_length=128):
+    def multilabel_preprocess(examples, tokenizer, text_col='text', label_col='label', max_length=512):
         tokenized = tokenizer(
             examples[text_col],
             padding='max_length',
