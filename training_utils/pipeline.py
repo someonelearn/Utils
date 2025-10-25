@@ -342,7 +342,7 @@ class NLPPipeline:
         tokenizer: AutoTokenizer,
         text_col: str = 'text',
         label_col: str = 'label',
-        max_length: int = 512,
+        max_length: int = 128,
         **kwargs
     ) -> Dict:
         """Tokenize text for classification."""
@@ -361,7 +361,7 @@ class NLPPipeline:
         tokenizer: AutoTokenizer,
         text_col: str = 'text',
         label_col: str = 'label',
-        max_length: int = 512,
+        max_length: int = 128,
         **kwargs
     ) -> Dict:
         """Tokenize text for regression."""
@@ -385,7 +385,7 @@ class NLPPipeline:
         tokenizer: AutoTokenizer,
         input_col: str = 'input',
         target_col: str = 'target',
-        max_input_length: int = 512,
+        max_input_length: int = 128,
         max_target_length: int = 128,
         **kwargs
     ) -> Dict:
@@ -750,7 +750,7 @@ class NLPPipeline:
         top_k: Optional[int] = None,
         return_encoded_labels: bool = False,
         return_embeddings: bool = False,
-        max_length: int = 512,
+        max_length: int = 128,
         **kwargs
     ) -> Union[Dict, List[Dict]]:
         """
@@ -1022,8 +1022,8 @@ class NLPPipeline:
         label_col: str = 'label',
         input_col: str = 'input',
         target_col: str = 'target',
-        max_length: int = 512,
-        max_input_length: int = 512,
+        max_length: int = 128,
+        max_input_length: int = 128,
         max_target_length: int = 128,
         num_epochs: int = 3,
         batch_size: int = 16,
