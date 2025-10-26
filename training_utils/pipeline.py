@@ -1499,4 +1499,4 @@ if __name__ == '__main__':
     
     print("\n" + "=" * 80)
     print("All examples completed successfully!")
-    print("=" * 80)s
+    print("=" * 80)
