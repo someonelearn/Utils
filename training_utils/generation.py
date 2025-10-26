@@ -199,15 +199,35 @@ class NLPGenerationPipeline:
         """Compute evaluation metrics for generation."""
         predictions, labels = eval_pred
         
-        # Decode predictions and labels
+        # Handle predictions
         if isinstance(predictions, tuple):
             predictions = predictions[0]
+        
+        # Convert to numpy array and ensure correct shape
+        predictions = np.array(predictions)
+        labels = np.array(labels)
+        
+        # For seq2seq models, predictions should be 2D: (batch_size, seq_length)
+        # If predictions is 3D, take argmax along last dimension
+        if predictions.ndim == 3:
+            predictions = np.argmax(predictions, axis=-1)
         
         # Replace -100 in labels (used for padding)
         labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
         
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        # Convert to list of lists for batch_decode (each element should be a list of ints)
+        predictions = predictions.tolist()
+        labels = labels.tolist()
+        
+        try:
+            decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+            decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        except Exception as e:
+            print(f"Error during decoding: {e}")
+            print(f"Predictions shape: {np.array(predictions).shape}")
+            print(f"Labels shape: {np.array(labels).shape}")
+            print(f"Sample prediction type: {type(predictions[0]) if predictions else 'empty'}")
+            raise
         
         # Clean whitespace
         decoded_preds = [pred.strip() for pred in decoded_preds]
