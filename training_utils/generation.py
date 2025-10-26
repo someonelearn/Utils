@@ -15,7 +15,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
     AutoConfig,
-    TrainingArguments,
+    Seq2SeqTrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
     DataCollatorForSeq2Seq,
@@ -255,7 +255,7 @@ class NLPGenerationPipeline:
         """Create training arguments."""
         fp16 = torch.cuda.is_available() if fp16 is None else fp16
         
-        return TrainingArguments(
+        return Seq2SeqTrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
             per_device_train_batch_size=batch_size,
