@@ -3,26 +3,12 @@ Unified modular pipeline for fine-tuning HuggingFace models for NLP tasks.
 Supports: Text Classification, Regression, and Text Generation.
 Each step can be customized by passing replacement functions.
 
-Usage:
-    from datasets import load_dataset
-    
-    # CLASSIFICATION
-    dataset = load_dataset('imdb')
-    pipeline = NLPPipeline(task_type='classification', encode_labels=True)
-    model, trainer = pipeline.run(dataset)
-    result = pipeline.predict("This movie was amazing!")
-    
-    # REGRESSION
-    dataset = load_dataset('glue', 'stsb')
-    pipeline = NLPPipeline(task_type='regression')
-    model, trainer = pipeline.run(dataset)
-    result = pipeline.predict("The cat sat on the mat")
-    
-    # GENERATION
-    dataset = load_dataset('squad')
-    pipeline = NLPPipeline(task_type='generation', generation_type='seq2seq')
-    model, trainer = pipeline.run(dataset)
-    result = pipeline.generate("Translate to French: Hello world")
+IMPROVEMENTS:
+- Fixed label encoding bugs
+- Enhanced training arguments control with kwargs merging
+- Better error handling and validation
+- Improved device management
+- More flexible configuration
 """
 
 import torch
@@ -54,6 +40,7 @@ from scipy.stats import pearsonr, spearmanr
 from pathlib import Path
 import json
 import pickle
+import warnings
 
 
 class NLPPipeline:
@@ -82,7 +69,8 @@ class NLPPipeline:
         model: Optional[Any] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         label_encoder: Optional['LabelEncoder'] = None,
-        encode_labels: bool = False
+        encode_labels: bool = False,
+        device: Optional[str] = None
     ):
         """
         Initialize unified NLP pipeline.
@@ -105,6 +93,7 @@ class NLPPipeline:
             tokenizer: Pre-loaded tokenizer instance
             label_encoder: Pre-fitted LabelEncoder instance
             encode_labels: Whether to automatically create and use label encoder
+            device: Device to use ('cuda', 'cpu', or None for auto-detection)
         """
         # Validate task type
         if task_type not in self.VALID_TASKS:
@@ -122,6 +111,16 @@ class NLPPipeline:
         self.tokenizer = tokenizer
         self.label_encoder = label_encoder
         self.encode_labels = encode_labels
+        
+        # Set device
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+        
+        # Move model to device if provided
+        if self.model is not None:
+            self.model = self.model.to(self.device)
         
         # Auto-determine problem_type if not specified
         if problem_type is None:
@@ -171,12 +170,18 @@ class NLPPipeline:
         
         print(f"Loading model from: {model_path}")
         
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        try:
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load tokenizer: {e}")
         
         # Load config to determine task type if not specified
         from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_path)
+        try:
+            config = AutoConfig.from_pretrained(model_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load config: {e}")
         
         if task_type is None:
             # Auto-detect task type from config
@@ -185,25 +190,32 @@ class NLPPipeline:
                     task_type = 'regression'
                 else:
                     task_type = 'classification'
-            elif 'T5' in config.architectures[0] or 'Bart' in config.architectures[0]:
-                task_type = 'generation'
-                generation_type = 'seq2seq'
-            elif 'GPT' in config.architectures[0] or 'LLaMA' in config.architectures[0]:
-                task_type = 'generation'
-                generation_type = 'causal'
+            elif hasattr(config, 'architectures') and config.architectures:
+                arch = config.architectures[0]
+                if 'T5' in arch or 'Bart' in arch:
+                    task_type = 'generation'
+                    generation_type = 'seq2seq'
+                elif 'GPT' in arch or 'LLaMA' in arch or 'Llama' in arch:
+                    task_type = 'generation'
+                    generation_type = 'causal'
+                else:
+                    task_type = 'classification'  # Default
             else:
                 task_type = 'classification'  # Default
             
             print(f"Auto-detected task type: {task_type}")
         
         # Load model based on task type
-        if task_type == 'generation':
-            if generation_type == 'seq2seq':
-                model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+        try:
+            if task_type == 'generation':
+                if generation_type == 'seq2seq':
+                    model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(model_path)
             else:
-                model = AutoModelForCausalLM.from_pretrained(model_path)
-        else:
-            model = AutoModelForSequenceClassification.from_pretrained(model_path)
+                model = AutoModelForSequenceClassification.from_pretrained(model_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model: {e}")
         
         # Set device
         if device is None:
@@ -219,9 +231,12 @@ class NLPPipeline:
         encoder_path = model_path / 'label_encoder.pkl'
         if encoder_path.exists():
             print("Loading label encoder...")
-            with open(encoder_path, 'rb') as f:
-                label_encoder = pickle.load(f)
-            print(f"Label encoder loaded with {len(label_encoder.classes_)} classes")
+            try:
+                with open(encoder_path, 'rb') as f:
+                    label_encoder = pickle.load(f)
+                print(f"Label encoder loaded with {len(label_encoder.classes_)} classes")
+            except Exception as e:
+                warnings.warn(f"Failed to load label encoder: {e}")
         
         # Create pipeline instance
         return cls(
@@ -230,7 +245,8 @@ class NLPPipeline:
             model=model,
             tokenizer=tokenizer,
             label_encoder=label_encoder,
-            use_pretrained_weights=True
+            use_pretrained_weights=True,
+            device=device
         )
     
     # ==================== DEFAULT FUNCTIONS ====================
@@ -238,12 +254,16 @@ class NLPPipeline:
     def _default_load_tokenizer(self, model_name: str, **kwargs) -> AutoTokenizer:
         """Load tokenizer."""
         print(f"Loading tokenizer: {model_name}")
-        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load tokenizer from {model_name}: {e}")
         
         # Add padding token if needed (for causal LM)
         if self.task_type == 'generation' and self.generation_type == 'causal':
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
+                print("Added pad_token (set to eos_token) for causal LM")
         
         return tokenizer
     
@@ -269,63 +289,79 @@ class NLPPipeline:
             id2label = None
             label2id = None
         
-        if self.use_pretrained_weights:
-            print(f"Loading {self.task_type} model: {model_name}")
+        try:
+            if self.use_pretrained_weights:
+                print(f"Loading {self.task_type} model: {model_name}")
+                
+                # Build kwargs conditionally
+                model_kwargs = {
+                    'num_labels': num_labels,
+                    'problem_type': self.problem_type,
+                    'ignore_mismatched_sizes': True,
+                    **kwargs
+                }
+                
+                # Only add label mappings if they exist (not for regression)
+                if id2label is not None:
+                    model_kwargs['id2label'] = id2label
+                if label2id is not None:
+                    model_kwargs['label2id'] = label2id
+                
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    model_name,
+                    **model_kwargs
+                )
+            else:
+                from transformers import AutoConfig
+                
+                config_kwargs = {
+                    'num_labels': num_labels,
+                    'problem_type': self.problem_type,
+                    **kwargs
+                }
+                
+                # Only add label mappings if they exist (not for regression)
+                if id2label is not None:
+                    config_kwargs['id2label'] = id2label
+                if label2id is not None:
+                    config_kwargs['label2id'] = label2id
+                
+                config = AutoConfig.from_pretrained(model_name, **config_kwargs)
+                model = AutoModelForSequenceClassification.from_config(config)
             
-            # Build kwargs conditionally
-            model_kwargs = {
-                'num_labels': num_labels,
-                'problem_type': self.problem_type,
-                'ignore_mismatched_sizes': True,
-                **kwargs
-            }
+            # Move to device
+            model = model.to(self.device)
+            return model
             
-            # Only add label mappings if they exist (not for regression)
-            if id2label is not None:
-                model_kwargs['id2label'] = id2label
-            if label2id is not None:
-                model_kwargs['label2id'] = label2id
-            
-            return AutoModelForSequenceClassification.from_pretrained(
-                model_name,
-                **model_kwargs
-            )
-        else:
-            from transformers import AutoConfig
-            
-            config_kwargs = {
-                'num_labels': num_labels,
-                'problem_type': self.problem_type,
-                **kwargs
-            }
-            
-            # Only add label mappings if they exist (not for regression)
-            if id2label is not None:
-                config_kwargs['id2label'] = id2label
-            if label2id is not None:
-                config_kwargs['label2id'] = label2id
-            
-            config = AutoConfig.from_pretrained(model_name, **config_kwargs)
-            return AutoModelForSequenceClassification.from_config(config)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load classification model: {e}")
     
     def _load_generation_model(self, model_name: str, **kwargs):
         """Load generation model."""
-        if self.generation_type == 'seq2seq':
-            print(f"Loading seq2seq model: {model_name}")
-            if self.use_pretrained_weights:
-                return AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
+        try:
+            if self.generation_type == 'seq2seq':
+                print(f"Loading seq2seq model: {model_name}")
+                if self.use_pretrained_weights:
+                    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
+                else:
+                    from transformers import AutoConfig
+                    config = AutoConfig.from_pretrained(model_name, **kwargs)
+                    model = AutoModelForSeq2SeqLM.from_config(config)
             else:
-                from transformers import AutoConfig
-                config = AutoConfig.from_pretrained(model_name, **kwargs)
-                return AutoModelForSeq2SeqLM.from_config(config)
-        else:
-            print(f"Loading causal LM model: {model_name}")
-            if self.use_pretrained_weights:
-                return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-            else:
-                from transformers import AutoConfig
-                config = AutoConfig.from_pretrained(model_name, **kwargs)
-                return AutoModelForCausalLM.from_config(config)
+                print(f"Loading causal LM model: {model_name}")
+                if self.use_pretrained_weights:
+                    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+                else:
+                    from transformers import AutoConfig
+                    config = AutoConfig.from_pretrained(model_name, **kwargs)
+                    model = AutoModelForCausalLM.from_config(config)
+            
+            # Move to device
+            model = model.to(self.device)
+            return model
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load generation model: {e}")
     
     def _get_default_preprocess(self) -> Callable:
         """Get default preprocessing function based on task type."""
@@ -443,11 +479,27 @@ class NLPPipeline:
         mse = mean_squared_error(labels, predictions)
         mae = mean_absolute_error(labels, predictions)
         rmse = np.sqrt(mse)
-        r2 = r2_score(labels, predictions)
         
-        # Correlation metrics
-        pearson_corr, _ = pearsonr(predictions, labels)
-        spearman_corr, _ = spearmanr(predictions, labels)
+        # Handle edge case where all predictions are the same
+        try:
+            r2 = r2_score(labels, predictions)
+        except:
+            r2 = 0.0
+        
+        # Correlation metrics with error handling
+        try:
+            pearson_corr, _ = pearsonr(predictions, labels)
+            if np.isnan(pearson_corr):
+                pearson_corr = 0.0
+        except:
+            pearson_corr = 0.0
+        
+        try:
+            spearman_corr, _ = spearmanr(predictions, labels)
+            if np.isnan(spearman_corr):
+                spearman_corr = 0.0
+        except:
+            spearman_corr = 0.0
         
         return {
             'mse': mse,
@@ -488,8 +540,14 @@ class NLPPipeline:
                 'rougeL': np.mean(rougeL_scores) * 100
             }
         except ImportError:
-            print("Warning: rouge-score not installed. Install with: pip install rouge-score")
-            # Fallback to simple metrics
+            warnings.warn("rouge-score not installed. Install with: pip install rouge-score")
+            return {
+                'rouge1': 0.0,
+                'rouge2': 0.0,
+                'rougeL': 0.0
+            }
+        except Exception as e:
+            warnings.warn(f"Error computing ROUGE scores: {e}")
             return {
                 'rouge1': 0.0,
                 'rouge2': 0.0,
@@ -499,13 +557,14 @@ class NLPPipeline:
     def _get_default_collate_fn(self) -> Callable:
         """Get default collate function based on task type."""
         if self.task_type == 'generation':
-            return self._collate_generation
+            return lambda batch: self._collate_generation(batch)
         else:
-            return self._collate_classification
+            return lambda batch: self._collate_classification(batch)
     
     def _collate_classification(self, batch):
         """Collate function for classification/regression."""
-        collated = DataCollatorWithPadding(self.tokenizer)(batch)
+        collator = DataCollatorWithPadding(self.tokenizer)
+        collated = collator(batch)
         
         # For regression, ensure labels are float tensors
         if self.task_type == 'regression' and 'labels' in collated:
@@ -515,11 +574,12 @@ class NLPPipeline:
     
     def _collate_generation(self, batch):
         """Collate function for generation."""
-        return DataCollatorForSeq2Seq(
+        collator = DataCollatorForSeq2Seq(
             self.tokenizer,
             model=self.model,
             padding=True
-        )(batch)
+        )
+        return collator(batch)
     
     def _get_default_training_args(self) -> Callable:
         """Get default training args function based on task type."""
@@ -540,32 +600,46 @@ class NLPPipeline:
         save_strategy: str = 'epoch',
         load_best_model: bool = True,
         seed: int = 42,
-        fp16: bool = torch.cuda.is_available(),
+        fp16: bool = None,
         **kwargs
     ):
-        """Create training arguments for classification/regression."""
+        """
+        Create training arguments for classification/regression.
+        
+        IMPROVED: All kwargs are passed through, allowing users to override
+        any TrainingArguments parameter without modifying this function.
+        """
+        # Auto-detect fp16 if not specified
+        if fp16 is None:
+            fp16 = torch.cuda.is_available()
+        
         metric_for_best = 'accuracy' if self.task_type == 'classification' else 'rmse'
         greater_is_better = True if self.task_type == 'classification' else False
         
-        return TrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            warmup_ratio=warmup_ratio,
-            eval_strategy=eval_strategy,
-            save_strategy=save_strategy,
-            load_best_model_at_end=load_best_model,
-            metric_for_best_model=metric_for_best,
-            greater_is_better=greater_is_better,
-            logging_steps=10,
-            seed=seed,
-            fp16=fp16,
-            report_to=['none'],
-            **kwargs
-        )
+        # Base arguments
+        base_args = {
+            'output_dir': output_dir,
+            'num_train_epochs': num_epochs,
+            'per_device_train_batch_size': batch_size,
+            'per_device_eval_batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'weight_decay': weight_decay,
+            'warmup_ratio': warmup_ratio,
+            'eval_strategy': eval_strategy,
+            'save_strategy': save_strategy,
+            'load_best_model_at_end': load_best_model,
+            'metric_for_best_model': metric_for_best,
+            'greater_is_better': greater_is_better,
+            'logging_steps': 10,
+            'seed': seed,
+            'fp16': fp16,
+            'report_to': ['none'],
+        }
+        
+        # Merge with user-provided kwargs (kwargs take precedence)
+        base_args.update(kwargs)
+        
+        return TrainingArguments(**base_args)
     
     def _create_training_args_generation(
         self,
@@ -579,33 +653,47 @@ class NLPPipeline:
         save_strategy: str = 'epoch',
         load_best_model: bool = True,
         seed: int = 42,
-        fp16: bool = torch.cuda.is_available(),
+        fp16: bool = None,
         generation_max_length: int = 128,
         predict_with_generate: bool = True,
         **kwargs
     ):
-        """Create training arguments for generation."""
-        return Seq2SeqTrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            warmup_ratio=warmup_ratio,
-            eval_strategy=eval_strategy,
-            save_strategy=save_strategy,
-            load_best_model_at_end=load_best_model,
-            metric_for_best_model='rougeL',
-            greater_is_better=True,
-            logging_steps=10,
-            seed=seed,
-            fp16=fp16,
-            predict_with_generate=predict_with_generate,
-            generation_max_length=generation_max_length,
-            report_to=['none'],
-            **kwargs
-        )
+        """
+        Create training arguments for generation.
+        
+        IMPROVED: All kwargs are passed through, allowing users to override
+        any Seq2SeqTrainingArguments parameter without modifying this function.
+        """
+        # Auto-detect fp16 if not specified
+        if fp16 is None:
+            fp16 = torch.cuda.is_available()
+        
+        # Base arguments
+        base_args = {
+            'output_dir': output_dir,
+            'num_train_epochs': num_epochs,
+            'per_device_train_batch_size': batch_size,
+            'per_device_eval_batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'weight_decay': weight_decay,
+            'warmup_ratio': warmup_ratio,
+            'eval_strategy': eval_strategy,
+            'save_strategy': save_strategy,
+            'load_best_model_at_end': load_best_model,
+            'metric_for_best_model': 'rougeL',
+            'greater_is_better': True,
+            'logging_steps': 10,
+            'seed': seed,
+            'fp16': fp16,
+            'predict_with_generate': predict_with_generate,
+            'generation_max_length': generation_max_length,
+            'report_to': ['none'],
+        }
+        
+        # Merge with user-provided kwargs (kwargs take precedence)
+        base_args.update(kwargs)
+        
+        return Seq2SeqTrainingArguments(**base_args)
     
     def _get_default_create_trainer(self) -> Callable:
         """Get default trainer creation function based on task type."""
@@ -666,19 +754,28 @@ class NLPPipeline:
         
         if 'test' in processed_dataset:
             print("\nEvaluating on test set...")
-            test_results = trainer.evaluate(processed_dataset['test'])
-            print(f"Test results: {test_results}")
-            results['test_results'] = test_results
+            try:
+                test_results = trainer.evaluate(processed_dataset['test'])
+                print(f"Test results: {test_results}")
+                results['test_results'] = test_results
+            except Exception as e:
+                warnings.warn(f"Failed to evaluate on test set: {e}")
         
         print(f"\nSaving model to {output_dir}")
-        trainer.save_model(output_dir)
-        tokenizer.save_pretrained(output_dir)
+        try:
+            trainer.save_model(output_dir)
+            tokenizer.save_pretrained(output_dir)
+        except Exception as e:
+            raise RuntimeError(f"Failed to save model: {e}")
         
         if self.label_encoder is not None:
             encoder_path = Path(output_dir) / 'label_encoder.pkl'
             print(f"Saving label encoder to: {encoder_path}")
-            with open(encoder_path, 'wb') as f:
-                pickle.dump(self.label_encoder, f)
+            try:
+                with open(encoder_path, 'wb') as f:
+                    pickle.dump(self.label_encoder, f)
+            except Exception as e:
+                warnings.warn(f"Failed to save label encoder: {e}")
         
         return results
     
@@ -689,6 +786,12 @@ class NLPPipeline:
         from sklearn.preprocessing import LabelEncoder
         
         all_labels = dataset['train'][label_col]
+        
+        # Check if labels are already integers
+        if all(isinstance(label, (int, np.integer)) for label in all_labels[:100]):
+            print("Labels are already integers, skipping label encoding")
+            return
+        
         self.label_encoder = LabelEncoder()
         self.label_encoder.fit(all_labels)
         
@@ -706,30 +809,64 @@ class NLPPipeline:
         
         def encode_labels(examples):
             labels = examples[label_col]
-            encoded = self.label_encoder.transform(labels)
-            examples[label_col] = encoded.tolist()
+            # Handle both string and already-encoded labels
+            try:
+                encoded = self.label_encoder.transform(labels)
+                examples[label_col] = encoded.tolist()
+            except ValueError as e:
+                # If transform fails, labels might already be encoded
+                warnings.warn(f"Label encoding failed, using original labels: {e}")
             return examples
         
-        return dataset.map(encode_labels, batched=True)
+        encoded_dataset = dataset.map(encode_labels, batched=True)
+        
+        # Validate encoded labels
+        self._validate_encoded_labels(encoded_dataset, label_col)
+        
+        return encoded_dataset
+    
+    def _validate_encoded_labels(self, dataset: DatasetDict, label_col: str = 'label'):
+        """Validate that encoded labels are within expected range."""
+        if self.label_encoder is None:
+            return
+        
+        num_classes = len(self.label_encoder.classes_)
+        
+        for split in dataset.keys():
+            labels = dataset[split][label_col]
+            unique_labels = set(labels)
+            
+            # Check if all labels are within valid range
+            invalid_labels = [l for l in unique_labels if l < 0 or l >= num_classes]
+            if invalid_labels:
+                raise ValueError(
+                    f"Found invalid encoded labels in {split} split: {invalid_labels}. "
+                    f"Expected labels in range [0, {num_classes-1}]"
+                )
     
     def _extract_label_info(self, dataset: DatasetDict, label_col: str) -> Dict:
         """Extract label information from dataset."""
         label_feature = dataset['train'].features.get(label_col)
         
+        # Check if dataset has ClassLabel feature
         if hasattr(label_feature, 'names') and label_feature.names:
             labels = label_feature.names
             num_labels = len(labels)
             label2id = {label: i for i, label in enumerate(labels)}
             id2label = {i: label for i, label in enumerate(labels)}
         else:
+            # Get unique labels from the dataset
             unique_labels = sorted(set(dataset['train'][label_col]))
             num_labels = len(unique_labels)
             
-            if all(isinstance(label, int) for label in unique_labels):
+            # Check if labels are integers
+            if all(isinstance(label, (int, np.integer)) for label in unique_labels):
+                # Integer labels - create string mappings
                 labels = [str(i) for i in range(num_labels)]
                 label2id = {str(i): i for i in range(num_labels)}
                 id2label = {i: str(i) for i in range(num_labels)}
             else:
+                # String labels - create mappings
                 labels = [str(label) for label in unique_labels]
                 label2id = {str(label): i for i, label in enumerate(unique_labels)}
                 id2label = {i: str(label) for i, label in enumerate(unique_labels)}
@@ -751,6 +888,7 @@ class NLPPipeline:
         return_encoded_labels: bool = False,
         return_embeddings: bool = False,
         max_length: int = 128,
+        batch_size: int = 32,
         **kwargs
     ) -> Union[Dict, List[Dict]]:
         """
@@ -763,6 +901,7 @@ class NLPPipeline:
             return_encoded_labels: Return encoded labels instead of decoded
             return_embeddings: Include model embeddings
             max_length: Maximum sequence length
+            batch_size: Batch size for processing multiple texts
         
         Returns:
             Prediction results
@@ -771,57 +910,62 @@ class NLPPipeline:
             raise ValueError("Use generate() method for generation tasks")
         
         if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model not loaded")
+            raise RuntimeError("Model not loaded. Please run the pipeline or load a pretrained model.")
         
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
         
-        # Tokenize
-        inputs = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors='pt'
-        )
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        # Process in batches for efficiency
+        all_results = []
         
-        # Inference
-        self.model.eval()
-        with torch.no_grad():
-            outputs = self.model(**inputs, output_hidden_states=return_embeddings)
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            
+            # Tokenize
+            inputs = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            )
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            # Inference
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(**inputs, output_hidden_states=return_embeddings)
+            
+            logits = outputs.logits
+            
+            # Extract embeddings if requested
+            embeddings = None
+            if return_embeddings and hasattr(outputs, 'hidden_states'):
+                embeddings = outputs.hidden_states[-1][:, 0, :].cpu()  # CLS token
+            
+            # Format results based on task type
+            if self.task_type == 'classification':
+                probs = torch.softmax(logits, dim=-1)
+                for j, prob in enumerate(probs):
+                    result = self._format_classification_prediction(
+                        prob,
+                        self.model.config.id2label,
+                        return_all_scores,
+                        top_k,
+                        return_encoded_labels
+                    )
+                    if embeddings is not None:
+                        result['embeddings'] = embeddings[j]
+                    all_results.append(result)
+            else:  # regression
+                predictions = logits.squeeze(-1).cpu().numpy()
+                for j, pred in enumerate(predictions):
+                    result = {'prediction': float(pred)}
+                    if embeddings is not None:
+                        result['embeddings'] = embeddings[j]
+                    all_results.append(result)
         
-        logits = outputs.logits
-        
-        # Extract embeddings if requested
-        embeddings = None
-        if return_embeddings and hasattr(outputs, 'hidden_states'):
-            embeddings = outputs.hidden_states[-1][:, 0, :]  # CLS token
-        
-        # Format results based on task type
-        results = []
-        if self.task_type == 'classification':
-            probs = torch.softmax(logits, dim=-1)
-            for i, prob in enumerate(probs):
-                result = self._format_classification_prediction(
-                    prob,
-                    self.model.config.id2label,
-                    return_all_scores,
-                    top_k,
-                    return_encoded_labels
-                )
-                if embeddings is not None:
-                    result['embeddings'] = embeddings[i].cpu()
-                results.append(result)
-        else:  # regression
-            predictions = logits.squeeze(-1).cpu().numpy()
-            for i, pred in enumerate(predictions):
-                result = {'prediction': float(pred)}
-                if embeddings is not None:
-                    result['embeddings'] = embeddings[i].cpu()
-                results.append(result)
-        
-        return results[0] if is_single else results
+        return all_results[0] if is_single else all_results
     
     def _format_classification_prediction(
         self,
@@ -835,13 +979,15 @@ class NLPPipeline:
         predicted_class = torch.argmax(probs).item()
         predicted_label = id2label.get(predicted_class, str(predicted_class))
         
-        # Decode label
+        # Decode label if label encoder exists
         if self.label_encoder is not None and not return_encoded_labels:
             try:
-                encoded = int(predicted_label) if isinstance(predicted_label, str) else predicted_label
-                predicted_label = self.label_encoder.inverse_transform([encoded])[0]
-            except (ValueError, IndexError):
-                pass
+                # Try to convert to int if it's a string representation
+                encoded = int(predicted_label) if isinstance(predicted_label, str) and predicted_label.isdigit() else predicted_label
+                if isinstance(encoded, int):
+                    predicted_label = self.label_encoder.inverse_transform([encoded])[0]
+            except (ValueError, IndexError, TypeError) as e:
+                warnings.warn(f"Failed to decode label: {e}")
         
         result = {
             'predicted_class': predicted_class,
@@ -849,30 +995,40 @@ class NLPPipeline:
             'confidence': probs[predicted_class].item()
         }
         
+        # Add top-k predictions
         if top_k is not None:
             top_probs, top_indices = torch.topk(probs, min(top_k, len(probs)))
             top_k_results = []
             for prob, idx in zip(top_probs, top_indices):
                 label = id2label.get(idx.item(), str(idx.item()))
+                
+                # Decode label
                 if self.label_encoder is not None and not return_encoded_labels:
                     try:
-                        encoded = int(label) if isinstance(label, str) else label
-                        label = self.label_encoder.inverse_transform([encoded])[0]
-                    except (ValueError, IndexError):
+                        encoded = int(label) if isinstance(label, str) and label.isdigit() else label
+                        if isinstance(encoded, int):
+                            label = self.label_encoder.inverse_transform([encoded])[0]
+                    except (ValueError, IndexError, TypeError):
                         pass
+                
                 top_k_results.append({'label': label, 'score': prob.item()})
             result['top_k'] = top_k_results
         
+        # Add all scores
         if return_all_scores:
             all_scores = {}
             for i, prob in enumerate(probs):
                 label = id2label.get(i, str(i))
+                
+                # Decode label
                 if self.label_encoder is not None and not return_encoded_labels:
                     try:
-                        encoded = int(label) if isinstance(label, str) else label
-                        label = self.label_encoder.inverse_transform([encoded])[0]
-                    except (ValueError, IndexError):
+                        encoded = int(label) if isinstance(label, str) and label.isdigit() else label
+                        if isinstance(encoded, int):
+                            label = self.label_encoder.inverse_transform([encoded])[0]
+                    except (ValueError, IndexError, TypeError):
                         pass
+                
                 all_scores[label] = prob.item()
             result['all_scores'] = all_scores
         
@@ -890,8 +1046,9 @@ class NLPPipeline:
         do_sample: bool = False,
         num_return_sequences: int = 1,
         early_stopping: bool = True,
+        batch_size: int = 8,
         **kwargs
-    ) -> Union[str, List[str]]:
+    ) -> Union[str, List[str], List[List[str]]]:
         """
         Generate text (for generation tasks).
         
@@ -906,6 +1063,7 @@ class NLPPipeline:
             do_sample: Whether to use sampling
             num_return_sequences: Number of sequences to return per input
             early_stopping: Whether to stop early
+            batch_size: Batch size for processing
         
         Returns:
             Generated text(s)
@@ -914,52 +1072,63 @@ class NLPPipeline:
             raise ValueError("Use predict() method for classification/regression tasks")
         
         if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model not loaded")
+            raise RuntimeError("Model not loaded. Please run the pipeline or load a pretrained model.")
         
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
         
-        # Tokenize
-        inputs = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            return_tensors='pt'
-        )
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        all_generated = []
         
-        # Generate
-        self.model.eval()
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                min_length=min_length,
-                num_beams=num_beams,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                do_sample=do_sample,
-                num_return_sequences=num_return_sequences,
-                early_stopping=early_stopping,
-                **kwargs
+        # Process in batches
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            
+            # Tokenize
+            inputs = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                return_tensors='pt'
             )
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            # Generate
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=max_length,
+                    min_length=min_length,
+                    num_beams=num_beams,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                    num_return_sequences=num_return_sequences,
+                    early_stopping=early_stopping,
+                    **kwargs
+                )
+            
+            # Decode
+            generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            all_generated.extend(generated_texts)
         
-        # Decode
-        generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        
+        # Format output
         if is_single and num_return_sequences == 1:
-            return generated_texts[0]
+            return all_generated[0]
         elif is_single:
-            return generated_texts
+            return all_generated
         else:
             # Group by input
-            results = []
-            for i in range(len(texts)):
-                start_idx = i * num_return_sequences
-                end_idx = start_idx + num_return_sequences
-                results.append(generated_texts[start_idx:end_idx])
-            return results if num_return_sequences > 1 else [r[0] for r in results]
+            if num_return_sequences == 1:
+                return all_generated
+            else:
+                results = []
+                for i in range(len(texts)):
+                    start_idx = i * num_return_sequences
+                    end_idx = start_idx + num_return_sequences
+                    results.append(all_generated[start_idx:end_idx])
+                return results
     
     # ==================== SAVE/LOAD ====================
     
@@ -972,14 +1141,21 @@ class NLPPipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         print(f"Saving model to: {output_dir}")
-        self.model.save_pretrained(output_dir)
-        self.tokenizer.save_pretrained(output_dir)
+        
+        try:
+            self.model.save_pretrained(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
+        except Exception as e:
+            raise RuntimeError(f"Failed to save model and tokenizer: {e}")
         
         if self.label_encoder is not None:
             encoder_path = output_dir / 'label_encoder.pkl'
-            with open(encoder_path, 'wb') as f:
-                pickle.dump(self.label_encoder, f)
-            print("Label encoder saved")
+            try:
+                with open(encoder_path, 'wb') as f:
+                    pickle.dump(self.label_encoder, f)
+                print("Label encoder saved")
+            except Exception as e:
+                warnings.warn(f"Failed to save label encoder: {e}")
         
         print("Model saved successfully")
     
@@ -995,21 +1171,37 @@ class NLPPipeline:
     ):
         """Validate dataset structure."""
         if not isinstance(dataset, (DatasetDict, dict)):
-            raise ValueError("Dataset must be a DatasetDict")
+            raise ValueError("Dataset must be a DatasetDict or dict")
         
         if 'train' not in dataset:
             raise ValueError("Dataset must contain a 'train' split")
         
+        if len(dataset['train']) == 0:
+            raise ValueError("Training dataset is empty")
+        
+        # Validate columns exist
         if self.task_type == 'generation':
             if input_col and input_col not in dataset['train'].column_names:
-                raise ValueError(f"Dataset must contain '{input_col}' column")
+                raise ValueError(
+                    f"Dataset must contain '{input_col}' column. "
+                    f"Available columns: {dataset['train'].column_names}"
+                )
             if target_col and target_col not in dataset['train'].column_names:
-                raise ValueError(f"Dataset must contain '{target_col}' column")
+                raise ValueError(
+                    f"Dataset must contain '{target_col}' column. "
+                    f"Available columns: {dataset['train'].column_names}"
+                )
         else:
             if text_col and text_col not in dataset['train'].column_names:
-                raise ValueError(f"Dataset must contain '{text_col}' column")
+                raise ValueError(
+                    f"Dataset must contain '{text_col}' column. "
+                    f"Available columns: {dataset['train'].column_names}"
+                )
             if label_col and label_col not in dataset['train'].column_names:
-                raise ValueError(f"Dataset must contain '{label_col}' column")
+                raise ValueError(
+                    f"Dataset must contain '{label_col}' column. "
+                    f"Available columns: {dataset['train'].column_names}"
+                )
     
     # ==================== MAIN PIPELINE ====================
     
@@ -1029,6 +1221,7 @@ class NLPPipeline:
         batch_size: int = 16,
         learning_rate: float = 2e-5,
         seed: int = 42,
+        training_args_kwargs: Optional[Dict] = None,
         **kwargs
     ) -> Tuple[Any, Any]:
         """
@@ -1049,7 +1242,9 @@ class NLPPipeline:
             batch_size: Training batch size
             learning_rate: Learning rate
             seed: Random seed
-            **kwargs: Additional arguments
+            training_args_kwargs: Additional TrainingArguments parameters (dict)
+                                 These will override the defaults
+            **kwargs: Deprecated - use training_args_kwargs instead
         
         Returns:
             Tuple of (trained_model, trainer)
@@ -1066,9 +1261,19 @@ class NLPPipeline:
         if output_dir is None:
             output_dir = f'./{self.task_type}_model'
         
+        # Merge training_args_kwargs with kwargs for backward compatibility
+        if training_args_kwargs is None:
+            training_args_kwargs = {}
+        training_args_kwargs.update(kwargs)
+        
         # Set seeds
         torch.manual_seed(seed)
         np.random.seed(seed)
+        
+        print(f"Starting {self.task_type} pipeline")
+        print(f"Model: {model_name}")
+        print(f"Device: {self.device}")
+        print(f"Output directory: {output_dir}")
         
         # Validate dataset
         if self.task_type == 'generation':
@@ -1079,19 +1284,26 @@ class NLPPipeline:
         # Handle label encoding for classification
         if self.task_type == 'classification':
             sample_label = dataset['train'][label_col][0]
+            
+            # Check if we need to encode labels
             if (self.encode_labels or self.label_encoder is not None) and isinstance(sample_label, str):
                 if self.label_encoder is None:
                     self._create_label_encoder(dataset, label_col)
-                dataset = self._encode_dataset_labels(dataset, label_col)
+                
+                if self.label_encoder is not None:
+                    dataset = self._encode_dataset_labels(dataset, label_col)
             
             # Extract label info
             label_info = self._extract_label_info(dataset, label_col)
             print(f"Number of labels: {label_info['num_labels']}")
+            print(f"Label mapping: {label_info['id2label']}")
         
         # Load tokenizer
+        print("\nLoading tokenizer...")
         self.tokenizer = self.load_tokenizer_fn(model_name)
         
         # Load model
+        print("Loading model...")
         if self.task_type == 'classification':
             self.model = self.load_model_fn(
                 model_name,
@@ -1102,8 +1314,10 @@ class NLPPipeline:
         else:
             self.model = self.load_model_fn(model_name)
         
+        print(f"Model loaded with {sum(p.numel() for p in self.model.parameters()):,} parameters")
+        
         # Preprocess dataset
-        print("Preprocessing dataset...")
+        print("\nPreprocessing dataset...")
         
         def transform(examples):
             if self.task_type == 'generation':
@@ -1126,6 +1340,12 @@ class NLPPipeline:
         
         processed_dataset = dataset.map(transform, batched=True)
         
+        print(f"Training samples: {len(processed_dataset['train'])}")
+        if 'validation' in processed_dataset:
+            print(f"Validation samples: {len(processed_dataset['validation'])}")
+        if 'test' in processed_dataset:
+            print(f"Test samples: {len(processed_dataset['test'])}")
+        
         # Create training arguments
         has_validation = 'validation' in dataset or 'test' in dataset
         eval_strategy = 'epoch' if has_validation else 'no'
@@ -1139,7 +1359,7 @@ class NLPPipeline:
                 seed=seed,
                 eval_strategy=eval_strategy,
                 generation_max_length=max_target_length,
-                **kwargs
+                **training_args_kwargs
             )
         else:
             training_args = self.create_training_args_fn(
@@ -1149,7 +1369,7 @@ class NLPPipeline:
                 learning_rate=learning_rate,
                 seed=seed,
                 eval_strategy=eval_strategy,
-                **kwargs
+                **training_args_kwargs
             )
         
         # Create trainer
@@ -1165,8 +1385,16 @@ class NLPPipeline:
         )
         
         # Train
-        print("Starting training...")
-        trainer.train()
+        print("\nStarting training...")
+        print("=" * 80)
+        
+        try:
+            trainer.train()
+        except Exception as e:
+            raise RuntimeError(f"Training failed: {e}")
+        
+        print("=" * 80)
+        print("Training completed!")
         
         # Post-training operations
         self.post_training_fn(
@@ -1186,241 +1414,49 @@ if __name__ == '__main__':
     from datasets import load_dataset, Dataset, DatasetDict
     
     print("=" * 80)
-    print("EXAMPLE 1: TEXT CLASSIFICATION WITH STRING LABELS")
+    print("IMPROVED NLP PIPELINE - EXAMPLE WITH ENHANCED TRAINING ARGS CONTROL")
     print("=" * 80)
     
-    # Create custom classification dataset
+    # Example: Using training_args_kwargs for fine control
     train_data = {
-        'text': [
-            "I love this movie!",
-            "This was terrible.",
-            "Amazing performance!",
-            "Waste of time.",
-            "Absolutely brilliant!",
-        ] * 100,
-        'label': ['positive', 'negative', 'positive', 'negative', 'positive'] * 100
-    }
-    
-    test_data = {
-        'text': ["Great film!", "Horrible experience.", "Not bad."],
-        'label': ['positive', 'negative', 'positive']
+        'text': ["I love this!", "Terrible.", "Amazing!"] * 100,
+        'label': ['positive', 'negative', 'positive'] * 100
     }
     
     classification_dataset = DatasetDict({
-        'train': Dataset.from_dict(train_data),
-        'test': Dataset.from_dict(test_data)
+        'train': Dataset.from_dict(train_data)
     })
     
-    # Train classification model
+    # IMPROVED: Users can now pass any TrainingArguments parameter
     pipeline = NLPPipeline(task_type='classification', encode_labels=True)
     model, trainer = pipeline.run(
         dataset=classification_dataset,
         model_name='bert-base-uncased',
-        output_dir='./sentiment_classifier',
+        output_dir='./my_model',
         num_epochs=3,
-        batch_size=16
+        batch_size=16,
+        training_args_kwargs={
+            # Override or add any TrainingArguments parameter
+            'gradient_accumulation_steps': 2,
+            'lr_scheduler_type': 'cosine',
+            'logging_steps': 50,
+            'save_total_limit': 2,
+            'evaluation_strategy': 'steps',
+            'eval_steps': 100,
+            'save_steps': 100,
+            'dataloader_num_workers': 4,
+            'group_by_length': True,
+            'length_column_name': 'length',
+            'label_smoothing_factor': 0.1,
+        }
     )
     
-    # Save and load
-    pipeline.save('./sentiment_classifier')
-    loaded_pipeline = NLPPipeline.from_pretrained('./sentiment_classifier')
-    
-    # Predict
-    result = loaded_pipeline.predict("This movie is fantastic!")
-    print(f"\nPrediction: {result['predicted_label']}")
-    print(f"Confidence: {result['confidence']:.4f}")
-    
-    # Batch prediction with top-3
-    results = loaded_pipeline.predict(
-        ["Great movie!", "Terrible film.", "It was okay."],
-        top_k=3
-    )
-    print("\nBatch predictions with top-3:")
-    for res in results:
-        print(f"  {res['predicted_label']}: {res['confidence']:.4f}")
-        print(f"  Top 3: {res['top_k']}")
-    
-    # Get all scores
-    result = loaded_pipeline.predict(
-        "Amazing film!",
-        return_all_scores=True
-    )
-    print(f"\nAll scores: {result['all_scores']}")
-    
-    # Get embeddings
-    result = loaded_pipeline.predict(
-        "Great movie!",
-        return_embeddings=True
-    )
-    print(f"\nEmbedding shape: {result['embeddings'].shape}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 2: REGRESSION (SENTIMENT SCORES)")
-    print("=" * 80)
-    
-    # Create regression dataset
-    regression_data = {
-        'text': [
-            "I absolutely love this!",
-            "It's terrible.",
-            "Pretty good.",
-            "Not bad at all.",
-            "Worst ever.",
-        ] * 100,
-        'label': [1.0, 0.0, 0.7, 0.6, 0.0] * 100
-    }
-    
-    regression_dataset = DatasetDict({
-        'train': Dataset.from_dict(regression_data)
-    })
-    
-    # Train regression model
-    pipeline = NLPPipeline(task_type='regression')
-    model, trainer = pipeline.run(
-        dataset=regression_dataset,
-        model_name='bert-base-uncased',
-        output_dir='./sentiment_regressor',
-        num_epochs=3,
-        batch_size=16
-    )
-    
-    # Predict
-    pipeline.save('./sentiment_regressor')
-    loaded_pipeline = NLPPipeline.from_pretrained(
-        './sentiment_regressor',
-        task_type='regression'
-    )
-    
-    result = loaded_pipeline.predict("This is amazing!")
-    print(f"\nSentiment score: {result['prediction']:.4f}")
-    
-    results = loaded_pipeline.predict([
-        "Best movie ever!",
-        "Completely awful.",
-        "It was okay."
-    ])
-    print("\nBatch sentiment scores:")
-    for res in results:
-        print(f"  {res['prediction']:.4f}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 3: TEXT GENERATION (SUMMARIZATION)")
-    print("=" * 80)
-    
-    # Create generation dataset
-    gen_data = {
-        'input': [
-            "summarize: The quick brown fox jumps over the lazy dog. " +
-            "This is a classic pangram used in typography.",
-            "translate English to French: Hello, how are you?",
-            "summarize: Machine learning is a subset of artificial intelligence."
-        ] * 50,
-        'target': [
-            "A pangram about a fox and dog.",
-            "Bonjour, comment allez-vous?",
-            "ML is part of AI."
-        ] * 50
-    }
-    
-    generation_dataset = DatasetDict({
-        'train': Dataset.from_dict(gen_data)
-    })
-    
-    # Train generation model
-    pipeline = NLPPipeline(task_type='generation', generation_type='seq2seq')
-    model, trainer = pipeline.run(
-        dataset=generation_dataset,
-        model_name='t5-small',
-        output_dir='./text_generator',
-        num_epochs=3,
-        batch_size=4
-    )
-    
-    # Generate
-    pipeline.save('./text_generator')
-    loaded_pipeline = NLPPipeline.from_pretrained(
-        './text_generator',
-        task_type='generation',
-        generation_type='seq2seq'
-    )
-    
-    output = loaded_pipeline.generate(
-        "summarize: Artificial intelligence is transforming the world.",
-        max_length=50,
-        num_beams=4
-    )
-    print(f"\nGenerated: {output}")
-    
-    # Batch generation
-    outputs = loaded_pipeline.generate([
-        "summarize: Python is popular.",
-        "translate English to French: Good morning."
-    ])
-    print("\nBatch generation:")
-    for out in outputs:
-        print(f"  {out}")
-    
-    # Multiple sequences
-    outputs = loaded_pipeline.generate(
-        "summarize: Deep learning uses neural networks.",
-        num_return_sequences=3,
-        do_sample=True,
-        top_k=50
-    )
-    print("\nMultiple generations:")
-    for i, out in enumerate(outputs, 1):
-        print(f"  {i}. {out}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 4: AUTO-DETECTION ON LOAD")
-    print("=" * 80)
-    
-    # Load without specifying task_type (auto-detected)
-    auto_pipeline = NLPPipeline.from_pretrained('./sentiment_classifier')
-    print(f"Auto-detected task: {auto_pipeline.task_type}")
-    
-    result = auto_pipeline.predict("This is wonderful!")
-    print(f"Prediction: {result['predicted_label']}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 5: MULTI-LABEL CLASSIFICATION")
-    print("=" * 80)
-    
-    # Multi-label dataset
-    multilabel_data = {
-        'text': [
-            "Action movie with great effects",
-            "Romantic comedy",
-            "Horror thriller"
-        ] * 100,
-        'label': [
-            [1, 0, 0, 1],  # action, effects
-            [0, 1, 1, 0],  # romance, comedy  
-            [0, 0, 0, 1]   # horror, thriller
-        ] * 100
-    }
-    
-    # Custom preprocessing for multi-label
-    def multilabel_preprocess(examples, tokenizer, text_col='text', label_col='label', max_length=512):
-        tokenized = tokenizer(
-            examples[text_col],
-            padding='max_length',
-            truncation=True,
-            max_length=max_length
-        )
-        tokenized['labels'] = examples[label_col]
-        return tokenized
-    
-    pipeline = NLPPipeline(
-        task_type='classification',
-        problem_type='multi_label_classification',
-        preprocess_fn=multilabel_preprocess
-    )
-    
-    print("Multi-label classification pipeline created")
-    print(f"Task type: {pipeline.task_type}")
-    print(f"Problem type: {pipeline.problem_type}")
-    
-    print("\n" + "=" * 80)
-    print("All examples completed successfully!")
-    print("=" * 80)
+    print("\n✓ Training completed with custom arguments!")
+    print("\nKey improvements:")
+    print("1. ✓ Fixed label encoding bugs")
+    print("2. ✓ Enhanced error handling throughout")
+    print("3. ✓ Better device management")
+    print("4. ✓ Full control over TrainingArguments via training_args_kwargs")
+    print("5. ✓ Batch processing for predictions")
+    print("6. ✓ Improved validation and error messages")
+    print("7. ✓ Better collate function handling")
