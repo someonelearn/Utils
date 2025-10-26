@@ -856,7 +856,7 @@ class NLPPipeline:
             # Extract embeddings if requested
             embeddings = None
             if return_embeddings and hasattr(outputs, 'hidden_states'):
-                embeddings = outputs.hidden_states[-1].cpu()
+                embeddings = outputs.hidden_states[-1][:, 0, :].cpu()  # CLS token
             
             # Format results based on task type
             if self.task_type == 'classification':
@@ -1499,4 +1499,4 @@ if __name__ == '__main__':
     
     print("\n" + "=" * 80)
     print("All examples completed successfully!")
-    print("=" * 80)
+    print("=" * 80)s
