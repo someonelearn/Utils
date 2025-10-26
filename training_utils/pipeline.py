@@ -486,15 +486,45 @@ class NLPPipeline:
         }
     
     def _compute_metrics_generation(self, eval_pred):
-        """Compute generation metrics."""
+        """Compute generation metrics with robust handling of invalid token IDs."""
         predictions, labels = eval_pred
         
-        # Decode predictions
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        # CRITICAL FIX: Clip predictions to valid token ID range
+        vocab_size = len(self.tokenizer)
+        
+        # Handle predictions that might be logits (need argmax) or token IDs
+        if len(predictions.shape) == 3:
+            # Predictions are logits [batch_size, seq_len, vocab_size]
+            predictions = np.argmax(predictions, axis=-1)
+        
+        # Ensure predictions are within valid range [0, vocab_size)
+        # Replace any invalid token IDs with pad_token_id
+        predictions = np.where(
+            (predictions >= 0) & (predictions < vocab_size),
+            predictions,
+            self.tokenizer.pad_token_id
+        )
+        
+        # Convert to int32 to avoid overflow issues
+        predictions = predictions.astype(np.int32)
+        
+        try:
+            # Decode predictions
+            decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        except Exception as e:
+            print(f"Warning: Failed to decode predictions: {e}")
+            # Fallback: return zero metrics
+            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
         
         # Replace -100 in labels as they are masked
         labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        labels = labels.astype(np.int32)
+        
+        try:
+            decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        except Exception as e:
+            print(f"Warning: Failed to decode labels: {e}")
+            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
         
         # Use rouge-score library
         try:
@@ -506,6 +536,12 @@ class NLPPipeline:
             rougeL_scores = []
             
             for pred, label in zip(decoded_preds, decoded_labels):
+                # Handle empty strings
+                if not pred.strip():
+                    pred = "empty"
+                if not label.strip():
+                    label = "empty"
+                
                 scores = scorer.score(label, pred)
                 rouge1_scores.append(scores['rouge1'].fmeasure)
                 rouge2_scores.append(scores['rouge2'].fmeasure)
@@ -518,6 +554,9 @@ class NLPPipeline:
             }
         except ImportError:
             warnings.warn("rouge-score not installed. Install with: pip install rouge-score")
+            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
+        except Exception as e:
+            print(f"Warning: ROUGE calculation failed: {e}")
             return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
     
     def _get_default_collate_fn(self) -> Callable:
