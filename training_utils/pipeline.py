@@ -802,7 +802,6 @@ class NLPPipeline:
         top_k: Optional[int] = None,
         return_encoded_labels: bool = False,
         return_embeddings: bool = False,
-        embedding_strategy: str = 'cls',
         max_length: int = 128,
         batch_size: int = 32,
         **kwargs
@@ -816,11 +815,6 @@ class NLPPipeline:
             top_k: Return top k predictions (classification only)
             return_encoded_labels: Return encoded labels instead of decoded
             return_embeddings: Include model embeddings
-            embedding_strategy: Strategy for extracting embeddings. Options:
-                - 'cls': Use [CLS] token (first token) representation
-                - 'last_token': Use last token representation
-                - 'mean': Mean pooling over all tokens
-                - 'mean_no_padding': Mean pooling excluding padding tokens (recommended)
             max_length: Maximum sequence length
             batch_size: Batch size for processing multiple inputs
         
@@ -832,13 +826,6 @@ class NLPPipeline:
         
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not loaded. Call run() first or load from pretrained.")
-        
-        # Validate embedding strategy
-        valid_strategies = ['cls', 'last_token', 'mean', 'mean_no_padding']
-        if embedding_strategy not in valid_strategies:
-            raise ValueError(
-                f"embedding_strategy must be one of {valid_strategies}, got '{embedding_strategy}'"
-            )
         
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
@@ -869,11 +856,7 @@ class NLPPipeline:
             # Extract embeddings if requested
             embeddings = None
             if return_embeddings and hasattr(outputs, 'hidden_states'):
-                embeddings = self._extract_embeddings(
-                    outputs.hidden_states[-1],
-                    inputs.get('attention_mask'),
-                    strategy=embedding_strategy
-                )
+                embeddings = outputs.hidden_states[-1][:, 0, :].cpu()  # CLS token
             
             # Format results based on task type
             if self.task_type == 'classification':
@@ -898,80 +881,6 @@ class NLPPipeline:
                     all_results.append(result)
         
         return all_results[0] if is_single else all_results
-    
-    def _extract_embeddings(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        strategy: str = 'cls'
-    ) -> torch.Tensor:
-        """
-        Extract embeddings from hidden states using specified strategy.
-        
-        Args:
-            hidden_states: Hidden states tensor of shape (batch_size, seq_len, hidden_dim)
-            attention_mask: Attention mask of shape (batch_size, seq_len)
-            strategy: Extraction strategy ('cls', 'last_token', 'mean', 'mean_no_padding')
-        
-        Returns:
-            Embeddings tensor of shape (batch_size, hidden_dim)
-        """
-        if strategy == 'cls':
-            # Use [CLS] token (first token)
-            embeddings = hidden_states[:, 0, :]
-        
-        elif strategy == 'last_token':
-            # Use last token
-            if attention_mask is not None:
-                # Find the last non-padding token for each sequence
-                seq_lengths = attention_mask.sum(dim=1) - 1  # -1 to get last position
-                batch_size = hidden_states.shape[0]
-                embeddings = hidden_states[
-                    torch.arange(batch_size, device=hidden_states.device),
-                    seq_lengths
-                ]
-            else:
-                # No attention mask, just use the last position
-                embeddings = hidden_states[:, -1, :]
-        
-        elif strategy == 'mean':
-            # Mean pooling over all tokens (including padding)
-            embeddings = hidden_states.mean(dim=1)
-        
-        elif strategy == 'mean_no_padding':
-            # Mean pooling excluding padding tokens
-            if attention_mask is not None:
-                # Expand attention mask to match hidden states dimensions
-                # attention_mask shape: (batch_size, seq_len)
-                # hidden_states shape: (batch_size, seq_len, hidden_dim)
-                attention_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.shape)
-                
-                # Mask out padding tokens
-                masked_hidden_states = hidden_states * attention_mask_expanded
-                
-                # Sum over sequence length
-                sum_hidden_states = masked_hidden_states.sum(dim=1)
-                
-                # Count non-padding tokens
-                sum_mask = attention_mask_expanded.sum(dim=1)
-                
-                # Avoid division by zero
-                sum_mask = torch.clamp(sum_mask, min=1e-9)
-                
-                # Compute mean
-                embeddings = sum_hidden_states / sum_mask
-            else:
-                # No attention mask provided, fall back to regular mean
-                warnings.warn(
-                    "attention_mask not available for 'mean_no_padding' strategy. "
-                    "Falling back to 'mean' strategy."
-                )
-                embeddings = hidden_states.mean(dim=1)
-        
-        else:
-            raise ValueError(f"Unknown embedding strategy: {strategy}")
-        
-        return embeddings.cpu()
     
     def _format_classification_prediction(
         self,
@@ -1458,35 +1367,7 @@ if __name__ == '__main__':
         "Great movie!",
         return_embeddings=True
     )
-    print(f"\nEmbedding shape (CLS strategy): {result['embeddings'].shape}")
-    
-    # Try different embedding strategies
-    print("\n" + "=" * 40)
-    print("Comparing Embedding Strategies:")
-    print("=" * 40)
-    
-    test_text = "This is an excellent film with great acting."
-    
-    strategies = ['cls', 'last_token', 'mean', 'mean_no_padding']
-    for strategy in strategies:
-        result = loaded_pipeline.predict(
-            test_text,
-            return_embeddings=True,
-            embedding_strategy=strategy
-        )
-        emb = result['embeddings']
-        print(f"\n{strategy:20s}: shape={emb.shape}, mean={emb.mean():.4f}, std={emb.std():.4f}")
-    
-    # Batch embeddings with mean_no_padding (recommended)
-    texts = ["Great movie!", "Terrible film.", "It was okay."]
-    results = loaded_pipeline.predict(
-        texts,
-        return_embeddings=True,
-        embedding_strategy='mean_no_padding'
-    )
-    print("\nBatch embeddings (mean_no_padding):")
-    for i, (text, res) in enumerate(zip(texts, results)):
-        print(f"  {i+1}. '{text}' -> embedding shape: {res['embeddings'].shape}")
+    print(f"\nEmbedding shape: {result['embeddings'].shape}")
     
     print("\n" + "=" * 80)
     print("EXAMPLE 2: REGRESSION (SENTIMENT SCORES)")
