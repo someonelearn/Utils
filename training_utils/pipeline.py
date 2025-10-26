@@ -1,107 +1,83 @@
 """
-Unified modular pipeline for fine-tuning HuggingFace models for NLP tasks.
-Supports: Text Classification, Regression, and Text Generation.
-Each step can be customized by passing replacement functions.
-
-CORRECTED VERSION - Fixes for critical bugs and edge cases
+Modular pipeline for fine-tuning HuggingFace models for classification and regression.
+Supports single-label classification, multi-label classification, and regression tasks.
 """
 
 import torch
+import numpy as np
+import warnings
+import pickle
+from pathlib import Path
+from typing import Dict, Tuple, Optional, Callable, Union, List, Any
+
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    AutoModelForSeq2SeqLM,
-    AutoModelForCausalLM,
+    AutoConfig,
     TrainingArguments,
     Trainer,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
     DataCollatorWithPadding,
-    DataCollatorForSeq2Seq,
 )
 from datasets import DatasetDict
-import numpy as np
-from typing import Dict, Tuple, Optional, Callable, Union, List, Any
+from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score
+    accuracy_score, f1_score, precision_score, recall_score,
+    mean_squared_error, mean_absolute_error, r2_score
 )
 from scipy.stats import pearsonr, spearmanr
-from pathlib import Path
-import json
-import pickle
-import warnings
 
 
 class NLPPipeline:
-    """
-    Unified modular pipeline for NLP tasks (classification, regression, generation).
-    Each step can be customized by passing replacement functions.
-    """
+    """Unified pipeline for text classification and regression tasks."""
     
-    VALID_TASKS = ['classification', 'regression', 'generation']
-    VALID_GENERATION_TYPES = ['seq2seq', 'causal']
+    VALID_TASKS = ['classification', 'regression']
     
     def __init__(
         self,
         task_type: str = 'classification',
-        generation_type: str = 'seq2seq',
         problem_type: Optional[str] = None,
+        encode_labels: bool = False,
+        model: Optional[Any] = None,
+        tokenizer: Optional[AutoTokenizer] = None,
+        label_encoder: Optional[LabelEncoder] = None,
+        # Customizable functions
         load_model_fn: Optional[Callable] = None,
         load_tokenizer_fn: Optional[Callable] = None,
         preprocess_fn: Optional[Callable] = None,
-        create_training_args_fn: Optional[Callable] = None,
         compute_metrics_fn: Optional[Callable] = None,
-        collate_fn: Optional[Callable] = None,
-        create_trainer_fn: Optional[Callable] = None,
-        post_training_fn: Optional[Callable] = None,
-        use_pretrained_weights: bool = True,
-        model: Optional[Any] = None,
-        tokenizer: Optional[AutoTokenizer] = None,
-        label_encoder: Optional['LabelEncoder'] = None,
-        encode_labels: bool = False
+        create_training_args_fn: Optional[Callable] = None,
     ):
-        """Initialize unified NLP pipeline."""
-        # Validate task type
-        if task_type not in self.VALID_TASKS:
-            raise ValueError(f"task_type must be one of {self.VALID_TASKS}, got '{task_type}'")
+        """
+        Initialize pipeline.
         
-        if task_type == 'generation' and generation_type not in self.VALID_GENERATION_TYPES:
-            raise ValueError(
-                f"generation_type must be one of {self.VALID_GENERATION_TYPES}, got '{generation_type}'"
-            )
+        Args:
+            task_type: 'classification' or 'regression'
+            problem_type: 'single_label_classification', 'multi_label_classification', or 'regression'
+            encode_labels: Whether to encode string labels to integers
+            model: Pre-loaded model (optional)
+            tokenizer: Pre-loaded tokenizer (optional)
+            label_encoder: Pre-fitted label encoder (optional)
+        """
+        if task_type not in self.VALID_TASKS:
+            raise ValueError(f"task_type must be one of {self.VALID_TASKS}")
         
         self.task_type = task_type
-        self.generation_type = generation_type
-        self.use_pretrained_weights = use_pretrained_weights
+        self.encode_labels = encode_labels
         self.model = model
         self.tokenizer = tokenizer
         self.label_encoder = label_encoder
-        self.encode_labels = encode_labels
         
-        # Auto-determine problem_type if not specified
+        # Auto-determine problem_type
         if problem_type is None:
-            if task_type == 'classification':
-                problem_type = 'single_label_classification'
-            elif task_type == 'regression':
-                problem_type = 'regression'
-        
+            problem_type = 'single_label_classification' if task_type == 'classification' else 'regression'
         self.problem_type = problem_type
         
-        # Set default functions based on task type
+        # Set customizable functions
         self.load_model_fn = load_model_fn or self._default_load_model
         self.load_tokenizer_fn = load_tokenizer_fn or self._default_load_tokenizer
-        self.preprocess_fn = preprocess_fn or self._get_default_preprocess()
-        self.create_training_args_fn = create_training_args_fn or self._get_default_training_args()
-        self.compute_metrics_fn = compute_metrics_fn or self._get_default_compute_metrics()
-        self.collate_fn = collate_fn or self._get_default_collate_fn()
-        self.create_trainer_fn = create_trainer_fn or self._get_default_create_trainer()
-        self.post_training_fn = post_training_fn or self._default_post_training
+        self.preprocess_fn = preprocess_fn or self._default_preprocess
+        self.compute_metrics_fn = compute_metrics_fn or self._default_compute_metrics
+        self.create_training_args_fn = create_training_args_fn or self._default_training_args
     
     # ==================== CLASS METHODS ====================
     
@@ -110,214 +86,75 @@ class NLPPipeline:
         cls,
         model_path: Union[str, Path],
         task_type: Optional[str] = None,
-        generation_type: str = 'seq2seq',
         device: Optional[str] = None
     ) -> 'NLPPipeline':
-        """Load a trained pipeline from saved files."""
+        """Load a trained pipeline from disk."""
         model_path = Path(model_path)
-        
         if not model_path.exists():
             raise ValueError(f"Model path does not exist: {model_path}")
         
-        print(f"Loading model from: {model_path}")
+        # Load tokenizer and config
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        config = AutoConfig.from_pretrained(model_path)
         
-        try:
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-            
-            # Load config to determine task type if not specified
-            from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(model_path)
-            
-            if task_type is None:
-                # Auto-detect task type from config
-                if hasattr(config, 'problem_type') and config.problem_type:
-                    if config.problem_type == 'regression':
-                        task_type = 'regression'
-                    else:
-                        task_type = 'classification'
-                elif hasattr(config, 'architectures') and config.architectures:
-                    arch = config.architectures[0]
-                    if 'T5' in arch or 'Bart' in arch or 'Pegasus' in arch:
-                        task_type = 'generation'
-                        generation_type = 'seq2seq'
-                    elif 'GPT' in arch or 'LLaMA' in arch or 'Llama' in arch:
-                        task_type = 'generation'
-                        generation_type = 'causal'
-                    else:
-                        task_type = 'classification'
-                else:
-                    task_type = 'classification'  # Default fallback
-                
-                print(f"Auto-detected task type: {task_type}")
-            
-            # Load model based on task type
-            if task_type == 'generation':
-                if generation_type == 'seq2seq':
-                    model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
-                else:
-                    model = AutoModelForCausalLM.from_pretrained(model_path)
-            else:
-                model = AutoModelForSequenceClassification.from_pretrained(model_path)
-            
-            # Set device
-            if device is None:
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            
-            model = model.to(device)
-            model.eval()
-            
-            print(f"Model loaded on device: {device}")
-            
-            # Load label encoder if exists
-            label_encoder = None
-            encoder_path = model_path / 'label_encoder.pkl'
-            if encoder_path.exists():
-                print("Loading label encoder...")
-                try:
-                    with open(encoder_path, 'rb') as f:
-                        label_encoder = pickle.load(f)
-                    print(f"Label encoder loaded with {len(label_encoder.classes_)} classes")
-                except Exception as e:
-                    warnings.warn(f"Failed to load label encoder: {e}")
-            
-            # Create pipeline instance
-            return cls(
-                task_type=task_type,
-                generation_type=generation_type,
-                model=model,
-                tokenizer=tokenizer,
-                label_encoder=label_encoder,
-                use_pretrained_weights=True
-            )
+        # Auto-detect task type from config
+        if task_type is None:
+            task_type = 'regression' if config.problem_type == 'regression' else 'classification'
         
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model from {model_path}: {str(e)}")
+        # Load model
+        model = AutoModelForSequenceClassification.from_pretrained(model_path)
+        
+        # Set device
+        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device).eval()
+        
+        # Load label encoder if exists
+        label_encoder = None
+        encoder_path = model_path / 'label_encoder.pkl'
+        if encoder_path.exists():
+            with open(encoder_path, 'rb') as f:
+                label_encoder = pickle.load(f)
+        
+        return cls(
+            task_type=task_type,
+            model=model,
+            tokenizer=tokenizer,
+            label_encoder=label_encoder
+        )
     
-    # ==================== DEFAULT FUNCTIONS ====================
+    # ==================== DEFAULT IMPLEMENTATIONS ====================
     
     def _default_load_tokenizer(self, model_name: str, **kwargs) -> AutoTokenizer:
-        """Load tokenizer."""
-        print(f"Loading tokenizer: {model_name}")
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
-            
-            # Add padding token if needed (for causal LM)
-            if self.task_type == 'generation' and self.generation_type == 'causal':
-                if tokenizer.pad_token is None:
-                    tokenizer.pad_token = tokenizer.eos_token
-                    tokenizer.pad_token_id = tokenizer.eos_token_id
-                    print("Set pad_token to eos_token for causal LM")
-            
-            return tokenizer
-        except Exception as e:
-            raise RuntimeError(f"Failed to load tokenizer '{model_name}': {str(e)}")
+        """Load tokenizer from HuggingFace."""
+        return AutoTokenizer.from_pretrained(model_name, **kwargs)
     
-    def _default_load_model(self, model_name: str, **kwargs):
-        """Load model based on task type."""
-        try:
-            if self.task_type == 'classification' or self.task_type == 'regression':
-                return self._load_classification_model(model_name, **kwargs)
-            elif self.task_type == 'generation':
-                return self._load_generation_model(model_name, **kwargs)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model '{model_name}': {str(e)}")
-    
-    def _load_classification_model(
-        self,
-        model_name: str,
-        num_labels: int = None,
-        id2label: Dict[int, str] = None,
-        label2id: Dict[str, int] = None,
-        **kwargs
-    ):
-        """Load classification/regression model."""
+    def _default_load_model(self, model_name: str, num_labels: int = None, 
+                           id2label: Dict = None, label2id: Dict = None, **kwargs):
+        """Load model from HuggingFace."""
         if self.task_type == 'regression':
             num_labels = 1
-            # For regression, don't pass id2label and label2id
-            id2label = None
-            label2id = None
+            id2label = label2id = None
         
         if num_labels is None:
             raise ValueError("num_labels must be specified for classification")
         
-        if self.use_pretrained_weights:
-            print(f"Loading {self.task_type} model: {model_name}")
-            
-            # Build kwargs conditionally
-            model_kwargs = {
-                'num_labels': num_labels,
-                'problem_type': self.problem_type,
-                'ignore_mismatched_sizes': True,
-                **kwargs
-            }
-            
-            # Only add label mappings if they exist (not for regression)
-            if id2label is not None:
-                model_kwargs['id2label'] = id2label
-            if label2id is not None:
-                model_kwargs['label2id'] = label2id
-            
-            return AutoModelForSequenceClassification.from_pretrained(
-                model_name,
-                **model_kwargs
-            )
-        else:
-            from transformers import AutoConfig
-            
-            config_kwargs = {
-                'num_labels': num_labels,
-                'problem_type': self.problem_type,
-                **kwargs
-            }
-            
-            # Only add label mappings if they exist (not for regression)
-            if id2label is not None:
-                config_kwargs['id2label'] = id2label
-            if label2id is not None:
-                config_kwargs['label2id'] = label2id
-            
-            config = AutoConfig.from_pretrained(model_name, **config_kwargs)
-            return AutoModelForSequenceClassification.from_config(config)
+        model_kwargs = {
+            'num_labels': num_labels,
+            'problem_type': self.problem_type,
+            'ignore_mismatched_sizes': True,
+            **kwargs
+        }
+        if id2label:
+            model_kwargs['id2label'] = id2label
+        if label2id:
+            model_kwargs['label2id'] = label2id
+        
+        return AutoModelForSequenceClassification.from_pretrained(model_name, **model_kwargs)
     
-    def _load_generation_model(self, model_name: str, **kwargs):
-        """Load generation model."""
-        if self.generation_type == 'seq2seq':
-            print(f"Loading seq2seq model: {model_name}")
-            if self.use_pretrained_weights:
-                return AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
-            else:
-                from transformers import AutoConfig
-                config = AutoConfig.from_pretrained(model_name, **kwargs)
-                return AutoModelForSeq2SeqLM.from_config(config)
-        else:
-            print(f"Loading causal LM model: {model_name}")
-            if self.use_pretrained_weights:
-                return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-            else:
-                from transformers import AutoConfig
-                config = AutoConfig.from_pretrained(model_name, **kwargs)
-                return AutoModelForCausalLM.from_config(config)
-    
-    def _get_default_preprocess(self) -> Callable:
-        """Get default preprocessing function based on task type."""
-        if self.task_type == 'generation':
-            return self._preprocess_generation
-        elif self.task_type == 'regression':
-            return self._preprocess_regression
-        else:
-            return self._preprocess_classification
-    
-    def _preprocess_classification(
-        self,
-        examples: Dict,
-        tokenizer: AutoTokenizer,
-        text_col: str = 'text',
-        label_col: str = 'label',
-        max_length: int = 128,
-        **kwargs
-    ) -> Dict:
-        """Tokenize text for classification."""
+    def _default_preprocess(self, examples: Dict, tokenizer: AutoTokenizer,
+                           text_col: str = 'text', label_col: str = 'label',
+                           max_length: int = 128, **kwargs) -> Dict:
+        """Tokenize text and prepare labels."""
         tokenized = tokenizer(
             examples[text_col],
             padding='max_length',
@@ -325,295 +162,89 @@ class NLPPipeline:
             max_length=max_length
         )
         
-        # Ensure labels are integers for classification
         labels = examples[label_col]
-        if isinstance(labels, (list, tuple)):
-            # Handle both single-label and multi-label
-            if isinstance(labels[0], (list, tuple)):
-                # Multi-label
-                tokenized['labels'] = labels
+        
+        # Convert to appropriate type based on task
+        if self.task_type == 'regression':
+            tokenized['labels'] = [float(l) for l in labels] if isinstance(labels, list) else float(labels)
+        else:
+            # Classification: ensure integers
+            if isinstance(labels, list):
+                tokenized['labels'] = labels if isinstance(labels[0], list) else [int(l) for l in labels]
             else:
-                # Single-label - convert to int
-                tokenized['labels'] = [int(label) for label in labels]
-        else:
-            tokenized['labels'] = int(labels)
+                tokenized['labels'] = int(labels)
         
         return tokenized
     
-    def _preprocess_regression(
-        self,
-        examples: Dict,
-        tokenizer: AutoTokenizer,
-        text_col: str = 'text',
-        label_col: str = 'label',
-        max_length: int = 128,
-        **kwargs
-    ) -> Dict:
-        """Tokenize text for regression."""
-        tokenized = tokenizer(
-            examples[text_col],
-            padding='max_length',
-            truncation=True,
-            max_length=max_length
-        )
-        
-        # Ensure labels are floats
-        labels = examples[label_col]
-        if isinstance(labels, (list, tuple)):
-            tokenized['labels'] = [float(label) for label in labels]
-        else:
-            tokenized['labels'] = float(labels)
-        
-        return tokenized
-    
-    def _preprocess_generation(
-        self,
-        examples: Dict,
-        tokenizer: AutoTokenizer,
-        input_col: str = 'input',
-        target_col: str = 'target',
-        max_input_length: int = 128,
-        max_target_length: int = 128,
-        **kwargs
-    ) -> Dict:
-        """Tokenize text for generation."""
-        model_inputs = tokenizer(
-            examples[input_col],
-            max_length=max_input_length,
-            truncation=True,
-            padding='max_length'
-        )
-        
-        # Handle target encoding based on model type
-        if self.generation_type == 'seq2seq':
-            labels = tokenizer(
-                text_target=examples[target_col],
-                max_length=max_target_length,
-                truncation=True,
-                padding='max_length'
-            )
-        else:
-            # For causal LM, tokenize targets normally
-            labels = tokenizer(
-                examples[target_col],
-                max_length=max_target_length,
-                truncation=True,
-                padding='max_length'
-            )
-        
-        model_inputs['labels'] = labels['input_ids']
-        return model_inputs
-    
-    def _get_default_compute_metrics(self) -> Callable:
-        """Get default metrics function based on task type."""
-        if self.task_type == 'classification':
-            return self._compute_metrics_classification
-        elif self.task_type == 'regression':
-            return self._compute_metrics_regression
-        else:
-            return self._compute_metrics_generation
-    
-    def _compute_metrics_classification(self, eval_pred):
-        """Compute classification metrics."""
+    def _default_compute_metrics(self, eval_pred):
+        """Compute evaluation metrics."""
         predictions, labels = eval_pred
         
-        # Handle multi-label classification
-        if self.problem_type == 'multi_label_classification':
-            # For multi-label, use sigmoid and threshold at 0.5
-            predictions = (torch.sigmoid(torch.tensor(predictions)) > 0.5).numpy()
-            
-            # Compute metrics for multi-label
-            accuracy = accuracy_score(labels, predictions)
-            f1 = f1_score(labels, predictions, average='macro', zero_division=0)
-            precision = precision_score(labels, predictions, average='macro', zero_division=0)
-            recall = recall_score(labels, predictions, average='macro', zero_division=0)
+        if self.task_type == 'classification':
+            return self._compute_classification_metrics(predictions, labels)
         else:
-            # Single-label classification
+            return self._compute_regression_metrics(predictions, labels)
+    
+    def _compute_classification_metrics(self, predictions, labels):
+        """Calculate classification metrics."""
+        if self.problem_type == 'multi_label_classification':
+            # Multi-label: sigmoid + threshold
+            predictions = (torch.sigmoid(torch.tensor(predictions)) > 0.5).numpy()
+            avg = 'macro'
+        else:
+            # Single-label: argmax
             predictions = np.argmax(predictions, axis=1)
-            
-            accuracy = accuracy_score(labels, predictions)
-            f1 = f1_score(labels, predictions, average='weighted', zero_division=0)
-            precision = precision_score(labels, predictions, average='weighted', zero_division=0)
-            recall = recall_score(labels, predictions, average='weighted', zero_division=0)
+            avg = 'weighted'
         
         return {
-            'accuracy': accuracy,
-            'f1': f1,
-            'precision': precision,
-            'recall': recall
+            'accuracy': accuracy_score(labels, predictions),
+            'f1': f1_score(labels, predictions, average=avg, zero_division=0),
+            'precision': precision_score(labels, predictions, average=avg, zero_division=0),
+            'recall': recall_score(labels, predictions, average=avg, zero_division=0)
         }
     
-    def _compute_metrics_regression(self, eval_pred):
-        """Compute regression metrics."""
-        predictions, labels = eval_pred
+    def _compute_regression_metrics(self, predictions, labels):
+        """Calculate regression metrics."""
         predictions = predictions.squeeze()
         
-        # Handle edge cases
-        if len(predictions) == 0 or len(labels) == 0:
-            return {
-                'mse': 0.0, 'rmse': 0.0, 'mae': 0.0,
-                'r2': 0.0, 'pearson': 0.0, 'spearman': 0.0
-            }
+        if len(predictions) == 0:
+            return {'mse': 0.0, 'rmse': 0.0, 'mae': 0.0, 'r2': 0.0}
         
-        # Calculate metrics
         mse = mean_squared_error(labels, predictions)
         mae = mean_absolute_error(labels, predictions)
-        rmse = np.sqrt(mse)
         r2 = r2_score(labels, predictions)
         
-        # Correlation metrics (handle edge cases)
+        # Correlation metrics with error handling
         try:
             pearson_corr, _ = pearsonr(predictions, labels)
-            if np.isnan(pearson_corr):
-                pearson_corr = 0.0
+            pearson_corr = 0.0 if np.isnan(pearson_corr) else pearson_corr
         except:
             pearson_corr = 0.0
         
         try:
             spearman_corr, _ = spearmanr(predictions, labels)
-            if np.isnan(spearman_corr):
-                spearman_corr = 0.0
+            spearman_corr = 0.0 if np.isnan(spearman_corr) else spearman_corr
         except:
             spearman_corr = 0.0
         
         return {
             'mse': mse,
-            'rmse': rmse,
+            'rmse': np.sqrt(mse),
             'mae': mae,
             'r2': r2,
             'pearson': pearson_corr,
             'spearman': spearman_corr
         }
     
-    def _compute_metrics_generation(self, eval_pred):
-        """Compute generation metrics with robust handling of invalid token IDs."""
-        predictions, labels = eval_pred
-        
-        # CRITICAL FIX: Clip predictions to valid token ID range
-        vocab_size = len(self.tokenizer)
-        
-        # Handle predictions that might be logits (need argmax) or token IDs
-        if len(predictions.shape) == 3:
-            # Predictions are logits [batch_size, seq_len, vocab_size]
-            predictions = np.argmax(predictions, axis=-1)
-        
-        # Ensure predictions are within valid range [0, vocab_size)
-        # Replace any invalid token IDs with pad_token_id
-        predictions = np.where(
-            (predictions >= 0) & (predictions < vocab_size),
-            predictions,
-            self.tokenizer.pad_token_id
-        )
-        
-        # Convert to int32 to avoid overflow issues
-        predictions = predictions.astype(np.int32)
-        
-        try:
-            # Decode predictions
-            decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        except Exception as e:
-            print(f"Warning: Failed to decode predictions: {e}")
-            # Fallback: return zero metrics
-            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
-        
-        # Replace -100 in labels as they are masked
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        labels = labels.astype(np.int32)
-        
-        try:
-            decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-        except Exception as e:
-            print(f"Warning: Failed to decode labels: {e}")
-            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
-        
-        # Use rouge-score library
-        try:
-            from rouge_score import rouge_scorer
-            scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-            
-            rouge1_scores = []
-            rouge2_scores = []
-            rougeL_scores = []
-            
-            for pred, label in zip(decoded_preds, decoded_labels):
-                # Handle empty strings
-                if not pred.strip():
-                    pred = "empty"
-                if not label.strip():
-                    label = "empty"
-                
-                scores = scorer.score(label, pred)
-                rouge1_scores.append(scores['rouge1'].fmeasure)
-                rouge2_scores.append(scores['rouge2'].fmeasure)
-                rougeL_scores.append(scores['rougeL'].fmeasure)
-            
-            return {
-                'rouge1': np.mean(rouge1_scores) * 100,
-                'rouge2': np.mean(rouge2_scores) * 100,
-                'rougeL': np.mean(rougeL_scores) * 100
-            }
-        except ImportError:
-            warnings.warn("rouge-score not installed. Install with: pip install rouge-score")
-            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
-        except Exception as e:
-            print(f"Warning: ROUGE calculation failed: {e}")
-            return {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
-    
-    def _get_default_collate_fn(self) -> Callable:
-        """Get default collate function based on task type."""
-        if self.task_type == 'generation':
-            return self._collate_generation
-        else:
-            return self._collate_classification
-    
-    def _collate_classification(self, batch):
-        """Collate function for classification/regression."""
-        collated = DataCollatorWithPadding(self.tokenizer)(batch)
-        
-        # For regression, ensure labels are float tensors
-        if self.task_type == 'regression' and 'labels' in collated:
-            if collated['labels'].dtype != torch.float:
-                collated['labels'] = collated['labels'].float()
-        
-        return collated
-    
-    def _collate_generation(self, batch):
-        """Collate function for generation."""
-        return DataCollatorForSeq2Seq(
-            self.tokenizer,
-            model=self.model,
-            padding=True
-        )(batch)
-    
-    def _get_default_training_args(self) -> Callable:
-        """Get default training args function based on task type."""
-        if self.task_type == 'generation':
-            return self._create_training_args_generation
-        else:
-            return self._create_training_args_classification
-    
-    def _create_training_args_classification(
-        self,
-        output_dir: str,
-        num_epochs: int = 3,
-        batch_size: int = 16,
-        learning_rate: float = 2e-5,
-        weight_decay: float = 0.01,
-        warmup_ratio: float = 0.1,
-        eval_strategy: str = 'epoch',
-        save_strategy: str = 'epoch',
-        load_best_model: bool = True,
-        seed: int = 42,
-        fp16: bool = None,
-        **kwargs
-    ):
-        """Create training arguments for classification/regression."""
-        # Auto-detect fp16 if not specified
-        if fp16 is None:
-            fp16 = torch.cuda.is_available()
+    def _default_training_args(self, output_dir: str, num_epochs: int = 3,
+                              batch_size: int = 16, learning_rate: float = 2e-5,
+                              eval_strategy: str = 'epoch', seed: int = 42,
+                              fp16: bool = None, **kwargs):
+        """Create training arguments."""
+        fp16 = torch.cuda.is_available() if fp16 is None else fp16
         
         metric_for_best = 'accuracy' if self.task_type == 'classification' else 'rmse'
-        greater_is_better = True if self.task_type == 'classification' else False
+        greater_is_better = self.task_type == 'classification'
         
         return TrainingArguments(
             output_dir=output_dir,
@@ -621,11 +252,11 @@ class NLPPipeline:
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=batch_size,
             learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            warmup_ratio=warmup_ratio,
+            weight_decay=0.01,
+            warmup_ratio=0.1,
             eval_strategy=eval_strategy,
-            save_strategy=save_strategy,
-            load_best_model_at_end=load_best_model,
+            save_strategy=eval_strategy,
+            load_best_model_at_end=True,
             metric_for_best_model=metric_for_best,
             greater_is_better=greater_is_better,
             logging_steps=10,
@@ -635,204 +266,51 @@ class NLPPipeline:
             **kwargs
         )
     
-    def _create_training_args_generation(
-        self,
-        output_dir: str,
-        num_epochs: int = 3,
-        batch_size: int = 8,
-        learning_rate: float = 3e-5,
-        weight_decay: float = 0.01,
-        warmup_ratio: float = 0.1,
-        eval_strategy: str = 'epoch',
-        save_strategy: str = 'epoch',
-        load_best_model: bool = True,
-        seed: int = 42,
-        fp16: bool = None,
-        generation_max_length: int = 128,
-        predict_with_generate: bool = True,
-        **kwargs
-    ):
-        """Create training arguments for generation."""
-        # Auto-detect fp16 if not specified
-        if fp16 is None:
-            fp16 = torch.cuda.is_available()
-        
-        return Seq2SeqTrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            warmup_ratio=warmup_ratio,
-            eval_strategy=eval_strategy,
-            save_strategy=save_strategy,
-            load_best_model_at_end=load_best_model,
-            metric_for_best_model='rougeL',
-            greater_is_better=True,
-            logging_steps=10,
-            seed=seed,
-            fp16=fp16,
-            predict_with_generate=predict_with_generate,
-            generation_max_length=generation_max_length,
-            report_to=['none'],
-            **kwargs
-        )
-    
-    def _get_default_create_trainer(self) -> Callable:
-        """Get default trainer creation function based on task type."""
-        if self.task_type == 'generation':
-            return self._create_trainer_generation
-        else:
-            return self._create_trainer_classification
-    
-    def _create_trainer_classification(
-        self,
-        model,
-        training_args,
-        train_dataset,
-        eval_dataset,
-        compute_metrics_fn,
-        collate_fn
-    ):
-        """Create Trainer for classification/regression."""
-        return Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            compute_metrics=compute_metrics_fn,
-            data_collator=collate_fn,
-        )
-    
-    def _create_trainer_generation(
-        self,
-        model,
-        training_args,
-        train_dataset,
-        eval_dataset,
-        compute_metrics_fn,
-        collate_fn
-    ):
-        """Create Seq2SeqTrainer for generation."""
-        return Seq2SeqTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            compute_metrics=compute_metrics_fn,
-            data_collator=collate_fn,
-            tokenizer=self.tokenizer
-        )
-    
-    def _default_post_training(
-        self,
-        trainer,
-        model,
-        tokenizer,
-        processed_dataset,
-        output_dir: str
-    ):
-        """Save model, tokenizer, and label encoder."""
-        results = {}
-        
-        if 'test' in processed_dataset:
-            print("\nEvaluating on test set...")
-            try:
-                test_results = trainer.evaluate(processed_dataset['test'])
-                print(f"Test results: {test_results}")
-                results['test_results'] = test_results
-            except Exception as e:
-                warnings.warn(f"Failed to evaluate on test set: {e}")
-        
-        print(f"\nSaving model to {output_dir}")
-        try:
-            trainer.save_model(output_dir)
-            tokenizer.save_pretrained(output_dir)
-            
-            if self.label_encoder is not None:
-                encoder_path = Path(output_dir) / 'label_encoder.pkl'
-                print(f"Saving label encoder to: {encoder_path}")
-                with open(encoder_path, 'wb') as f:
-                    pickle.dump(self.label_encoder, f)
-        except Exception as e:
-            warnings.warn(f"Failed to save model: {e}")
-        
-        return results
-    
     # ==================== LABEL ENCODING ====================
     
     def _create_label_encoder(self, dataset: DatasetDict, label_col: str = 'label'):
-        """Create label encoder for string labels."""
-        from sklearn.preprocessing import LabelEncoder
-        
+        """Create and fit label encoder for string labels."""
         all_labels = dataset['train'][label_col]
         
-        # Flatten if nested (shouldn't be, but defensive)
         if isinstance(all_labels[0], (list, tuple)):
             raise ValueError("Cannot use label encoder for multi-label classification")
         
         self.label_encoder = LabelEncoder()
         self.label_encoder.fit(all_labels)
         
-        print(f"Label encoder created with {len(self.label_encoder.classes_)} classes")
-        print(f"Classes: {list(self.label_encoder.classes_[:20])}")
-        if len(self.label_encoder.classes_) > 20:
-            print(f"... and {len(self.label_encoder.classes_) - 20} more")
+        print(f"Label encoder: {len(self.label_encoder.classes_)} classes")
     
-    def _encode_dataset_labels(self, dataset: DatasetDict, label_col: str = 'label') -> DatasetDict:
-        """Encode labels using label encoder."""
-        if self.label_encoder is None:
-            raise RuntimeError("Label encoder not initialized")
-        
-        print("Encoding labels...")
-        
-        def encode_labels(examples):
-            labels = examples[label_col]
-            # Ensure we're working with a list
-            if not isinstance(labels, list):
-                labels = [labels]
-            
-            try:
-                encoded = self.label_encoder.transform(labels)
-                examples[label_col] = encoded.tolist()
-            except Exception as e:
-                raise RuntimeError(f"Failed to encode labels: {e}")
-            
+    def _encode_dataset_labels(self, dataset: DatasetDict, label_col: str = 'label'):
+        """Apply label encoder to dataset."""
+        def encode(examples):
+            labels = examples[label_col] if isinstance(examples[label_col], list) else [examples[label_col]]
+            examples[label_col] = self.label_encoder.transform(labels).tolist()
             return examples
         
-        return dataset.map(encode_labels, batched=True)
+        return dataset.map(encode, batched=True)
     
     def _extract_label_info(self, dataset: DatasetDict, label_col: str) -> Dict:
-        """Extract label information from dataset."""
+        """Extract label mapping from dataset."""
         label_feature = dataset['train'].features.get(label_col)
         
+        # Try to get labels from feature metadata
         if hasattr(label_feature, 'names') and label_feature.names:
             labels = label_feature.names
-            num_labels = len(labels)
-            label2id = {label: i for i, label in enumerate(labels)}
-            id2label = {i: label for i, label in enumerate(labels)}
         else:
             unique_labels = sorted(set(dataset['train'][label_col]))
-            num_labels = len(unique_labels)
-            
-            if all(isinstance(label, int) for label in unique_labels):
-                labels = [str(i) for i in range(num_labels)]
-                label2id = {str(i): i for i in range(num_labels)}
-                id2label = {i: str(i) for i in range(num_labels)}
-            else:
-                labels = [str(label) for label in unique_labels]
-                label2id = {str(label): i for i, label in enumerate(unique_labels)}
-                id2label = {i: str(label) for i, label in enumerate(unique_labels)}
+            labels = [str(l) for l in unique_labels]
+        
+        num_labels = len(labels)
+        label2id = {label: i for i, label in enumerate(labels)}
+        id2label = {i: label for i, label in enumerate(labels)}
         
         return {
-            'labels': labels,
             'num_labels': num_labels,
             'label2id': label2id,
             'id2label': id2label
         }
     
-    # ==================== PREDICTION METHODS ====================
+    # ==================== PREDICTION ====================
     
     def predict(
         self,
@@ -840,42 +318,33 @@ class NLPPipeline:
         return_all_scores: bool = False,
         top_k: Optional[int] = None,
         return_encoded_labels: bool = False,
-        return_embeddings: bool = False,
         max_length: int = 128,
         batch_size: int = 32,
         **kwargs
     ) -> Union[Dict, List[Dict]]:
         """
-        Make predictions (for classification/regression).
+        Make predictions on text.
         
         Args:
             text: Single text or list of texts
-            return_all_scores: Return probabilities for all classes (classification only)
-            top_k: Return top k predictions (classification only)
+            return_all_scores: Return probabilities for all classes (classification)
+            top_k: Return top k predictions (classification)
             return_encoded_labels: Return encoded labels instead of decoded
-            return_embeddings: Include model embeddings
             max_length: Maximum sequence length
-            batch_size: Batch size for processing multiple inputs
-        
-        Returns:
-            Prediction results
+            batch_size: Batch size for processing
         """
-        if self.task_type == 'generation':
-            raise ValueError("Use generate() method for generation tasks")
-        
         if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model not loaded. Call run() first or load from pretrained.")
+            raise RuntimeError("Model not loaded. Call run() or from_pretrained() first.")
         
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
         
-        # Process in batches for large inputs
         all_results = []
         
+        # Process in batches
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i+batch_size]
             
-            # Tokenize
             inputs = self.tokenizer(
                 batch_texts,
                 padding=True,
@@ -885,351 +354,132 @@ class NLPPipeline:
             )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
             
-            # Inference
             self.model.eval()
             with torch.no_grad():
-                outputs = self.model(**inputs, output_hidden_states=return_embeddings)
+                outputs = self.model(**inputs)
             
             logits = outputs.logits
             
-            # Extract embeddings if requested
-            embeddings = None
-            if return_embeddings and hasattr(outputs, 'hidden_states'):
-                embeddings = outputs.hidden_states[-1][:, 0, :].cpu()  # CLS token
-            
-            # Format results based on task type
             if self.task_type == 'classification':
                 probs = torch.softmax(logits, dim=-1)
-                for j, prob in enumerate(probs):
-                    result = self._format_classification_prediction(
-                        prob,
-                        self.model.config.id2label,
-                        return_all_scores,
-                        top_k,
-                        return_encoded_labels
+                for prob in probs:
+                    result = self._format_classification_result(
+                        prob, return_all_scores, top_k, return_encoded_labels
                     )
-                    if embeddings is not None:
-                        result['embeddings'] = embeddings[j].numpy()
                     all_results.append(result)
             else:  # regression
                 predictions = logits.squeeze(-1).cpu().numpy()
-                for j, pred in enumerate(predictions):
-                    result = {'prediction': float(pred)}
-                    if embeddings is not None:
-                        result['embeddings'] = embeddings[j].numpy()
-                    all_results.append(result)
+                all_results.extend([{'prediction': float(p)} for p in predictions])
         
         return all_results[0] if is_single else all_results
     
-    def _format_classification_prediction(
-        self,
-        probs: torch.Tensor,
-        id2label: Dict[int, str],
-        return_all_scores: bool,
-        top_k: Optional[int],
-        return_encoded_labels: bool
-    ) -> Dict:
+    def _format_classification_result(self, probs: torch.Tensor, return_all_scores: bool,
+                                     top_k: Optional[int], return_encoded_labels: bool) -> Dict:
         """Format classification prediction results."""
         predicted_class = torch.argmax(probs).item()
+        id2label = self.model.config.id2label
         predicted_label = id2label.get(predicted_class, str(predicted_class))
         
         # Decode label if encoder exists
-        if self.label_encoder is not None and not return_encoded_labels:
+        if self.label_encoder and not return_encoded_labels:
             try:
-                # Convert to int for encoder lookup
-                encoded = int(predicted_label) if isinstance(predicted_label, str) and predicted_label.isdigit() else predicted_class
-                
-                # Validate encoded value is within range
+                encoded = int(predicted_label) if predicted_label.isdigit() else predicted_class
                 if 0 <= encoded < len(self.label_encoder.classes_):
                     predicted_label = self.label_encoder.inverse_transform([encoded])[0]
-            except (ValueError, IndexError, TypeError) as e:
-                warnings.warn(f"Failed to decode label: {e}")
+            except:
+                pass
         
         result = {
             'predicted_class': predicted_class,
             'predicted_label': predicted_label,
-            'confidence': float(probs[predicted_class].item())
+            'confidence': float(probs[predicted_class])
         }
         
-        if top_k is not None:
+        if top_k:
             top_probs, top_indices = torch.topk(probs, min(top_k, len(probs)))
-            top_k_results = []
-            for prob, idx in zip(top_probs, top_indices):
-                label = id2label.get(idx.item(), str(idx.item()))
-                
-                # Decode label if encoder exists
-                if self.label_encoder is not None and not return_encoded_labels:
-                    try:
-                        encoded = int(label) if isinstance(label, str) and label.isdigit() else idx.item()
-                        if 0 <= encoded < len(self.label_encoder.classes_):
-                            label = self.label_encoder.inverse_transform([encoded])[0]
-                    except (ValueError, IndexError, TypeError):
-                        pass
-                
-                top_k_results.append({'label': label, 'score': float(prob.item())})
-            result['top_k'] = top_k_results
+            result['top_k'] = [
+                {
+                    'label': self._decode_label(idx.item(), id2label, return_encoded_labels),
+                    'score': float(prob)
+                }
+                for prob, idx in zip(top_probs, top_indices)
+            ]
         
         if return_all_scores:
-            all_scores = {}
-            for i, prob in enumerate(probs):
-                label = id2label.get(i, str(i))
-                
-                # Decode label if encoder exists
-                if self.label_encoder is not None and not return_encoded_labels:
-                    try:
-                        encoded = int(label) if isinstance(label, str) and label.isdigit() else i
-                        if 0 <= encoded < len(self.label_encoder.classes_):
-                            label = self.label_encoder.inverse_transform([encoded])[0]
-                    except (ValueError, IndexError, TypeError):
-                        pass
-                
-                all_scores[str(label)] = float(prob.item())
-            result['all_scores'] = all_scores
+            result['all_scores'] = {
+                str(self._decode_label(i, id2label, return_encoded_labels)): float(prob)
+                for i, prob in enumerate(probs)
+            }
         
         return result
     
-    def generate(
-        self,
-        text: Union[str, List[str]],
-        max_length: int = 128,
-        min_length: int = 10,
-        num_beams: int = 4,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        do_sample: bool = False,
-        num_return_sequences: int = 1,
-        early_stopping: bool = True,
-        batch_size: int = 8,
-        **kwargs
-    ) -> Union[str, List[str], List[List[str]]]:
-        """
-        Generate text (for generation tasks).
+    def _decode_label(self, idx: int, id2label: Dict, return_encoded: bool) -> str:
+        """Decode a label index to its string representation."""
+        label = id2label.get(idx, str(idx))
         
-        Args:
-            text: Input text or list of texts
-            max_length: Maximum generation length
-            min_length: Minimum generation length
-            num_beams: Number of beams for beam search
-            temperature: Sampling temperature
-            top_k: Top-k sampling
-            top_p: Nucleus sampling
-            do_sample: Whether to use sampling
-            num_return_sequences: Number of sequences to return per input
-            early_stopping: Whether to stop early
-            batch_size: Batch size for processing
+        if self.label_encoder and not return_encoded:
+            try:
+                encoded = int(label) if label.isdigit() else idx
+                if 0 <= encoded < len(self.label_encoder.classes_):
+                    return self.label_encoder.inverse_transform([encoded])[0]
+            except:
+                pass
         
-        Returns:
-            Generated text(s)
-        """
-        if self.task_type != 'generation':
-            raise ValueError("Use predict() method for classification/regression tasks")
-        
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model not loaded. Call run() first or load from pretrained.")
-        
-        is_single = isinstance(text, str)
-        texts = [text] if is_single else text
-        
-        all_generated = []
-        
-        # Process in batches
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
-            
-            # Tokenize
-            inputs = self.tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                return_tensors='pt'
-            )
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-            
-            # Set pad_token_id if not set
-            gen_kwargs = {
-                'max_length': max_length,
-                'min_length': min_length,
-                'num_beams': num_beams,
-                'temperature': temperature,
-                'top_k': top_k,
-                'top_p': top_p,
-                'do_sample': do_sample,
-                'num_return_sequences': num_return_sequences,
-                'early_stopping': early_stopping,
-                **kwargs
-            }
-            
-            # Add pad_token_id if not in kwargs
-            if 'pad_token_id' not in gen_kwargs and self.tokenizer.pad_token_id is not None:
-                gen_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
-            
-            # Generate
-            self.model.eval()
-            with torch.no_grad():
-                try:
-                    outputs = self.model.generate(**inputs, **gen_kwargs)
-                except Exception as e:
-                    raise RuntimeError(f"Generation failed: {e}")
-            
-            # Decode
-            generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            all_generated.extend(generated_texts)
-        
-        # Format output
-        if is_single and num_return_sequences == 1:
-            return all_generated[0]
-        elif is_single:
-            return all_generated[:num_return_sequences]
-        else:
-            # Group by input
-            if num_return_sequences == 1:
-                return all_generated
-            else:
-                results = []
-                for i in range(len(texts)):
-                    start_idx = i * num_return_sequences
-                    end_idx = start_idx + num_return_sequences
-                    results.append(all_generated[start_idx:end_idx])
-                return results
+        return label
     
-    # ==================== SAVE/LOAD ====================
-    
-    def save(self, output_dir: Union[str, Path]):
-        """Save model, tokenizer, and label encoder."""
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("No model to save. Train or load a model first.")
-        
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"Saving model to: {output_dir}")
-        
-        try:
-            self.model.save_pretrained(output_dir)
-            self.tokenizer.save_pretrained(output_dir)
-            
-            if self.label_encoder is not None:
-                encoder_path = output_dir / 'label_encoder.pkl'
-                with open(encoder_path, 'wb') as f:
-                    pickle.dump(self.label_encoder, f)
-                print("Label encoder saved")
-            
-            print("Model saved successfully")
-        except Exception as e:
-            raise RuntimeError(f"Failed to save model: {e}")
-    
-    # ==================== VALIDATION ====================
-    
-    def _validate_dataset(
-        self,
-        dataset: DatasetDict,
-        text_col: Optional[str] = None,
-        label_col: Optional[str] = None,
-        input_col: Optional[str] = None,
-        target_col: Optional[str] = None
-    ):
-        """Validate dataset structure."""
-        if not isinstance(dataset, (DatasetDict, dict)):
-            raise ValueError("Dataset must be a DatasetDict or dict")
-        
-        if 'train' not in dataset:
-            raise ValueError("Dataset must contain a 'train' split")
-        
-        train_columns = dataset['train'].column_names
-        
-        if self.task_type == 'generation':
-            if input_col and input_col not in train_columns:
-                raise ValueError(f"Dataset must contain '{input_col}' column. Available: {train_columns}")
-            if target_col and target_col not in train_columns:
-                raise ValueError(f"Dataset must contain '{target_col}' column. Available: {train_columns}")
-        else:
-            if text_col and text_col not in train_columns:
-                raise ValueError(f"Dataset must contain '{text_col}' column. Available: {train_columns}")
-            if label_col and label_col not in train_columns:
-                raise ValueError(f"Dataset must contain '{label_col}' column. Available: {train_columns}")
-    
-    # ==================== MAIN PIPELINE ====================
+    # ==================== TRAINING ====================
     
     def run(
         self,
         dataset: DatasetDict,
-        model_name: str = None,
+        model_name: str = 'bert-base-uncased',
         output_dir: str = None,
         text_col: str = 'text',
         label_col: str = 'label',
-        input_col: str = 'input',
-        target_col: str = 'target',
         max_length: int = 128,
-        max_input_length: int = 128,
-        max_target_length: int = 128,
         num_epochs: int = 3,
         batch_size: int = 16,
         learning_rate: float = 2e-5,
         seed: int = 42,
         **kwargs
-    ) -> Tuple[Any, Any]:
+    ) -> Tuple[Any, Trainer]:
         """
         Run the complete fine-tuning pipeline.
         
         Returns:
             Tuple of (trained_model, trainer)
         """
-        # Set defaults based on task type
-        if model_name is None:
-            if self.task_type == 'classification' or self.task_type == 'regression':
-                model_name = 'bert-base-uncased'
-            elif self.generation_type == 'seq2seq':
-                model_name = 't5-small'
-            else:
-                model_name = 'gpt2'
-        
-        if output_dir is None:
-            output_dir = f'./{self.task_type}_model'
+        output_dir = output_dir or f'./{self.task_type}_model'
         
         # Set seeds
         torch.manual_seed(seed)
         np.random.seed(seed)
         
         # Validate dataset
-        print("Validating dataset...")
-        if self.task_type == 'generation':
-            self._validate_dataset(dataset, input_col=input_col, target_col=target_col)
-        else:
-            self._validate_dataset(dataset, text_col=text_col, label_col=label_col)
+        if 'train' not in dataset:
+            raise ValueError("Dataset must contain 'train' split")
+        if text_col not in dataset['train'].column_names:
+            raise ValueError(f"Dataset must contain '{text_col}' column")
         
         # Handle label encoding for classification
         label_info = None
         if self.task_type == 'classification':
-            try:
-                sample_label = dataset['train'][label_col][0]
-                
-                # Check if we need label encoding
-                if (self.encode_labels or self.label_encoder is not None) and isinstance(sample_label, str):
-                    if self.label_encoder is None:
-                        self._create_label_encoder(dataset, label_col)
-                    dataset = self._encode_dataset_labels(dataset, label_col)
-                
-                # Extract label info
-                label_info = self._extract_label_info(dataset, label_col)
-                print(f"Number of labels: {label_info['num_labels']}")
-                
-                # Validate encoded labels
-                max_label = max(dataset['train'][label_col])
-                if max_label >= label_info['num_labels']:
-                    raise ValueError(
-                        f"Label {max_label} exceeds num_labels {label_info['num_labels']}. "
-                        "Check label encoding or dataset labels."
-                    )
-            except Exception as e:
-                raise RuntimeError(f"Failed to process labels: {e}")
+            sample_label = dataset['train'][label_col][0]
+            
+            # Encode string labels if needed
+            if (self.encode_labels or self.label_encoder) and isinstance(sample_label, str):
+                if self.label_encoder is None:
+                    self._create_label_encoder(dataset, label_col)
+                dataset = self._encode_dataset_labels(dataset, label_col)
+            
+            label_info = self._extract_label_info(dataset, label_col)
+            print(f"Number of labels: {label_info['num_labels']}")
         
-        # Load tokenizer
-        print("Loading tokenizer...")
+        # Load tokenizer and model
+        print(f"Loading tokenizer: {model_name}")
         self.tokenizer = self.load_tokenizer_fn(model_name)
         
-        # Load model
-        print("Loading model...")
+        print(f"Loading model: {model_name}")
         if self.task_type == 'classification':
             self.model = self.load_model_fn(
                 model_name,
@@ -1242,300 +492,165 @@ class NLPPipeline:
         
         # Preprocess dataset
         print("Preprocessing dataset...")
-        
-        def transform(examples):
-            try:
-                if self.task_type == 'generation':
-                    return self.preprocess_fn(
-                        examples,
-                        self.tokenizer,
-                        input_col=input_col,
-                        target_col=target_col,
-                        max_input_length=max_input_length,
-                        max_target_length=max_target_length
-                    )
-                else:
-                    return self.preprocess_fn(
-                        examples,
-                        self.tokenizer,
-                        text_col=text_col,
-                        label_col=label_col,
-                        max_length=max_length
-                    )
-            except Exception as e:
-                raise RuntimeError(f"Preprocessing failed: {e}")
-        
-        processed_dataset = dataset.map(transform, batched=True)
+        processed_dataset = dataset.map(
+            lambda examples: self.preprocess_fn(
+                examples, self.tokenizer, text_col, label_col, max_length
+            ),
+            batched=True
+        )
         
         # Create training arguments
-        has_validation = 'validation' in dataset or 'test' in dataset
-        eval_strategy = 'epoch' if has_validation else 'no'
+        has_eval = 'validation' in dataset or 'test' in dataset
+        eval_strategy = 'epoch' if has_eval else 'no'
         
-        print("Creating training arguments...")
-        if self.task_type == 'generation':
-            training_args = self.create_training_args_fn(
-                output_dir=output_dir,
-                num_epochs=num_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
-                eval_strategy=eval_strategy,
-                generation_max_length=max_target_length,
-                **kwargs
-            )
-        else:
-            training_args = self.create_training_args_fn(
-                output_dir=output_dir,
-                num_epochs=num_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
-                eval_strategy=eval_strategy,
-                **kwargs
-            )
+        training_args = self.create_training_args_fn(
+            output_dir=output_dir,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            eval_strategy=eval_strategy,
+            seed=seed,
+            **kwargs
+        )
+        
+        # Create data collator
+        data_collator = DataCollatorWithPadding(self.tokenizer)
+        
+        # Ensure regression labels are floats
+        if self.task_type == 'regression':
+            original_collator = data_collator
+            def collate_fn(batch):
+                collated = original_collator(batch)
+                if 'labels' in collated and collated['labels'].dtype != torch.float:
+                    collated['labels'] = collated['labels'].float()
+                return collated
+            data_collator = collate_fn
         
         # Create trainer
-        print("Creating trainer...")
         eval_dataset = processed_dataset.get('validation') or processed_dataset.get('test')
-        
-        trainer = self.create_trainer_fn(
+        trainer = Trainer(
             model=self.model,
-            training_args=training_args,
+            args=training_args,
             train_dataset=processed_dataset['train'],
             eval_dataset=eval_dataset,
-            compute_metrics_fn=self.compute_metrics_fn if eval_dataset else None,
-            collate_fn=self.collate_fn
+            compute_metrics=self.compute_metrics_fn if eval_dataset else None,
+            data_collator=data_collator,
         )
         
         # Train
-        print("Starting training...")
-        print(f"  Task: {self.task_type}")
-        print(f"  Model: {model_name}")
-        print(f"  Epochs: {num_epochs}")
-        print(f"  Batch size: {batch_size}")
-        print(f"  Learning rate: {learning_rate}")
+        print(f"\nTraining {self.task_type} model...")
+        print(f"  Epochs: {num_epochs} | Batch: {batch_size} | LR: {learning_rate}")
+        trainer.train()
         
-        try:
-            trainer.train()
-            print("Training completed successfully!")
-        except Exception as e:
-            raise RuntimeError(f"Training failed: {e}")
+        # Save
+        print(f"\nSaving to {output_dir}")
+        trainer.save_model(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
         
-        # Post-training operations
-        print("Running post-training operations...")
-        self.post_training_fn(
-            trainer,
-            self.model,
-            self.tokenizer,
-            processed_dataset,
-            output_dir
-        )
+        if self.label_encoder:
+            encoder_path = Path(output_dir) / 'label_encoder.pkl'
+            with open(encoder_path, 'wb') as f:
+                pickle.dump(self.label_encoder, f)
+        
+        # Test evaluation
+        if 'test' in processed_dataset:
+            test_results = trainer.evaluate(processed_dataset['test'])
+            print(f"Test results: {test_results}")
         
         return self.model, trainer
+    
+    def save(self, output_dir: Union[str, Path]):
+        """Save model, tokenizer, and label encoder."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("No model to save")
+        
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        if self.label_encoder:
+            with open(output_dir / 'label_encoder.pkl', 'wb') as f:
+                pickle.dump(self.label_encoder, f)
 
 
 # ==================== EXAMPLE USAGE ====================
 
 if __name__ == '__main__':
-    from datasets import load_dataset, Dataset, DatasetDict
+    from datasets import Dataset, DatasetDict
     
-    print("=" * 80)
-    print("EXAMPLE 1: TEXT CLASSIFICATION WITH STRING LABELS")
-    print("=" * 80)
+    print("=" * 60)
+    print("CLASSIFICATION EXAMPLE")
+    print("=" * 60)
     
-    # Create custom classification dataset
+    # Create dataset
     train_data = {
-        'text': [
-            "I love this movie!",
-            "This was terrible.",
-            "Amazing performance!",
-            "Waste of time.",
-            "Absolutely brilliant!",
-        ] * 100,
-        'label': ['positive', 'negative', 'positive', 'negative', 'positive'] * 100
+        'text': ["I love this!", "Terrible.", "Amazing!"] * 100,
+        'label': ['positive', 'negative', 'positive'] * 100
     }
-    
-    test_data = {
-        'text': ["Great film!", "Horrible experience.", "Not bad."],
-        'label': ['positive', 'negative', 'positive']
-    }
-    
-    classification_dataset = DatasetDict({
+    dataset = DatasetDict({
         'train': Dataset.from_dict(train_data),
-        'test': Dataset.from_dict(test_data)
+        'test': Dataset.from_dict({
+            'text': ["Great!", "Awful."],
+            'label': ['positive', 'negative']
+        })
     })
     
-    # Train classification model
+    # Train
     pipeline = NLPPipeline(task_type='classification', encode_labels=True)
     model, trainer = pipeline.run(
-        dataset=classification_dataset,
+        dataset=dataset,
         model_name='bert-base-uncased',
-        output_dir='./sentiment_classifier',
+        output_dir='./classifier',
         num_epochs=3,
         batch_size=16
     )
     
-    # Save and load
-    pipeline.save('./sentiment_classifier')
-    loaded_pipeline = NLPPipeline.from_pretrained('./sentiment_classifier')
+    # Load and predict
+    pipeline = NLPPipeline.from_pretrained('./classifier')
+    result = pipeline.predict("This is fantastic!")
+    print(f"\nPrediction: {result['predicted_label']} ({result['confidence']:.4f})")
     
-    # Predict
-    result = loaded_pipeline.predict("This movie is fantastic!")
-    print(f"\nPrediction: {result['predicted_label']}")
-    print(f"Confidence: {result['confidence']:.4f}")
-    
-    # Batch prediction with top-3
-    results = loaded_pipeline.predict(
-        ["Great movie!", "Terrible film.", "It was okay."],
+    # Batch with top-3
+    results = pipeline.predict(
+        ["Great!", "Bad.", "Okay."],
         top_k=3
     )
-    print("\nBatch predictions with top-3:")
-    for res in results:
-        print(f"  {res['predicted_label']}: {res['confidence']:.4f}")
-        print(f"  Top 3: {res['top_k']}")
+    print("\nBatch predictions:")
+    for r in results:
+        print(f"  {r['predicted_label']}: {r['confidence']:.4f}")
     
-    # Get all scores
-    result = loaded_pipeline.predict(
-        "Amazing film!",
-        return_all_scores=True
-    )
-    print(f"\nAll scores: {result['all_scores']}")
+    print("\n" + "=" * 60)
+    print("REGRESSION EXAMPLE")
+    print("=" * 60)
     
-    # Get embeddings
-    result = loaded_pipeline.predict(
-        "Great movie!",
-        return_embeddings=True
-    )
-    print(f"\nEmbedding shape: {result['embeddings'].shape}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 2: REGRESSION (SENTIMENT SCORES)")
-    print("=" * 80)
-    
-    # Create regression dataset
-    regression_data = {
-        'text': [
-            "I absolutely love this!",
-            "It's terrible.",
-            "Pretty good.",
-            "Not bad at all.",
-            "Worst ever.",
-        ] * 100,
-        'label': [1.0, 0.0, 0.7, 0.6, 0.0] * 100
+    # Create dataset
+    reg_data = {
+        'text': ["Love it!", "Hate it.", "It's okay."] * 100,
+        'label': [1.0, 0.0, 0.5] * 100
     }
+    dataset = DatasetDict({'train': Dataset.from_dict(reg_data)})
     
-    regression_dataset = DatasetDict({
-        'train': Dataset.from_dict(regression_data)
-    })
-    
-    # Train regression model
+    # Train
     pipeline = NLPPipeline(task_type='regression')
     model, trainer = pipeline.run(
-        dataset=regression_dataset,
+        dataset=dataset,
         model_name='bert-base-uncased',
-        output_dir='./sentiment_regressor',
-        num_epochs=3,
-        batch_size=16
+        output_dir='./regressor',
+        num_epochs=3
     )
     
     # Predict
-    pipeline.save('./sentiment_regressor')
-    loaded_pipeline = NLPPipeline.from_pretrained(
-        './sentiment_regressor',
-        task_type='regression'
-    )
+    pipeline = NLPPipeline.from_pretrained('./regressor', task_type='regression')
+    result = pipeline.predict("Amazing!")
+    print(f"\nScore: {result['prediction']:.4f}")
     
-    result = loaded_pipeline.predict("This is amazing!")
-    print(f"\nSentiment score: {result['prediction']:.4f}")
+    results = pipeline.predict(["Best!", "Worst!", "Meh."])
+    print("\nBatch scores:")
+    for r in results:
+        print(f"  {r['prediction']:.4f}")
     
-    results = loaded_pipeline.predict([
-        "Best movie ever!",
-        "Completely awful.",
-        "It was okay."
-    ])
-    print("\nBatch sentiment scores:")
-    for res in results:
-        print(f"  {res['prediction']:.4f}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 3: TEXT GENERATION (SUMMARIZATION)")
-    print("=" * 80)
-    
-    # Create generation dataset
-    gen_data = {
-        'input': [
-            "summarize: The quick brown fox jumps over the lazy dog. " +
-            "This is a classic pangram used in typography.",
-            "translate English to French: Hello, how are you?",
-            "summarize: Machine learning is a subset of artificial intelligence."
-        ] * 50,
-        'target': [
-            "A pangram about a fox and dog.",
-            "Bonjour, comment allez-vous?",
-            "ML is part of AI."
-        ] * 50
-    }
-    
-    generation_dataset = DatasetDict({
-        'train': Dataset.from_dict(gen_data)
-    })
-    
-    # Train generation model
-    pipeline = NLPPipeline(task_type='generation', generation_type='seq2seq')
-    model, trainer = pipeline.run(
-        dataset=generation_dataset,
-        model_name='t5-small',
-        output_dir='./text_generator',
-        num_epochs=3,
-        batch_size=4
-    )
-    
-    # Generate
-    pipeline.save('./text_generator')
-    loaded_pipeline = NLPPipeline.from_pretrained(
-        './text_generator',
-        task_type='generation',
-        generation_type='seq2seq'
-    )
-    
-    output = loaded_pipeline.generate(
-        "summarize: Artificial intelligence is transforming the world.",
-        max_length=50,
-        num_beams=4
-    )
-    print(f"\nGenerated: {output}")
-    
-    # Batch generation
-    outputs = loaded_pipeline.generate([
-        "summarize: Python is popular.",
-        "translate English to French: Good morning."
-    ])
-    print("\nBatch generation:")
-    for out in outputs:
-        print(f"  {out}")
-    
-    # Multiple sequences
-    outputs = loaded_pipeline.generate(
-        "summarize: Deep learning uses neural networks.",
-        num_return_sequences=3,
-        do_sample=True,
-        top_k=50
-    )
-    print("\nMultiple generations:")
-    for i, out in enumerate(outputs, 1):
-        print(f"  {i}. {out}")
-    
-    print("\n" + "=" * 80)
-    print("EXAMPLE 4: AUTO-DETECTION ON LOAD")
-    print("=" * 80)
-    
-    # Load without specifying task_type (auto-detected)
-    auto_pipeline = NLPPipeline.from_pretrained('./sentiment_classifier')
-    print(f"Auto-detected task: {auto_pipeline.task_type}")
-    
-    result = auto_pipeline.predict("This is wonderful!")
-    print(f"Prediction: {result['predicted_label']}")
-    
-    print("\n" + "=" * 80)
-    print("All examples completed successfully!")
-    print("=" * 80)
+    print("\n" + "=" * 60)
+    print("Done!")
+    print("=" * 60)
