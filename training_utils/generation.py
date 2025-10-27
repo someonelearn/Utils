@@ -416,30 +416,86 @@ class SFTPipelineTrainer:
         model_init_kwargs: Optional[Dict[str, Any]] = None,
         data_collator_kwargs: Optional[Dict[str, Any]] = None,
         save_path: Optional[str] = None,
+        # new args to support HF DatasetDict inputs
+        train_split: Optional[str] = None,
+        eval_splits: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         trainer_kwargs = trainer_kwargs or {}
         model_init_kwargs = model_init_kwargs or {}
         data_collator_kwargs = data_collator_kwargs or {}
 
-        # 1) ingest
-        ingest_out = self.ingest_fn(source)
-        logger.info(f"Ingested {len(ingest_out.records)} records")
+        # 1) If the user passed a Hugging Face DatasetDict, handle per-split preprocessing/tokenization
+        from datasets import concatenate_datasets
 
-        # 2) preprocess
-        preprocess_out = self.preprocess_fn(ingest_out.records, self.task)
-        logger.info(f"Preprocessed to {len(preprocess_out.examples)} examples")
+        if isinstance(source, DatasetDict):
+            logger.info(f"Detected DatasetDict with splits: {list(source.keys())}")
 
-        # 3) model + tokenizer init
-        model, tokenizer = self.model_init_fn(model_name_or_path, **(model_init_kwargs or {}))
-        logger.info(f"Loaded model/tokenizer: {model_name_or_path}")
+            # choose train split
+            if train_split and train_split in source:
+                raw_train = source[train_split]
+            else:
+                raw_train = source.get("train") or source.get("training") or next(iter(source.values()))
 
-        # 4) tokenize
-        tokenize_out = self.tokenize_fn(preprocess_out.examples, tokenizer, self.task, max_length=max_length or self.default_max_length)
-        logger.info(f"Tokenized into {len(tokenize_out.encodings)} tokenized examples")
+            # choose evaluation splits (try common names if not provided)
+            if eval_splits:
+                selected_eval = [s for s in eval_splits if s in source]
+            else:
+                preferred = ["validation", "valid", "eval", "test"]
+                selected_eval = [s for s in preferred if s in source]
 
-        # 5) prepare dataset (split)
-        dataset_out = self.prepare_dataset_fn(tokenize_out, split_ratio=split_ratio)
-        logger.info(f"Prepared dataset (train/eval): {bool(dataset_out.train_dataset)}/{bool(dataset_out.eval_dataset)}")
+            # helper to preprocess+tokenize a HF dataset split into an HFDataset of tokenized encodings
+            def _preprocess_tokenize_hfds(hf_ds):
+                records = [dict(r) for r in hf_ds]
+                preprocess_out = self.preprocess_fn(records, self.task)
+                model, tokenizer = self.model_init_fn(model_name_or_path, **(model_init_kwargs or {}))
+                # We only need the tokenizer here; ensure model isn't loaded multiple times unnecessarily
+                # If model_init_fn returns (model, tokenizer) we discard model and re-init below; that's acceptable.
+                tokenize_out = self.tokenize_fn(preprocess_out.examples, tokenizer, self.task, max_length=max_length or self.default_max_length)
+                # convert tokenized encodings -> HFDataset
+                keys = set(k for d in tokenize_out.encodings for k in d.keys())
+                out = {k: [] for k in keys}
+                for item in tokenize_out.encodings:
+                    for k in keys:
+                        out[k].append(item.get(k))
+                return HFDataset.from_dict(out)
+
+            train_ds = _preprocess_tokenize_hfds(raw_train)
+
+            if selected_eval:
+                eval_dsets = [_preprocess_tokenize_hfds(source[s]) for s in selected_eval]
+                if len(eval_dsets) == 1:
+                    eval_ds = eval_dsets[0]
+                else:
+                    eval_ds = concatenate_datasets(eval_dsets)
+            else:
+                eval_ds = None
+
+            dataset_out = DatasetOutput(train_dataset=train_ds, eval_dataset=eval_ds)
+
+            # model + tokenizer init (do once now that we've tokenized)
+            model, tokenizer = self.model_init_fn(model_name_or_path, **(model_init_kwargs or {}))
+            logger.info(f"Loaded model/tokenizer: {model_name_or_path}")
+
+        else:
+            # 1) ingest
+            ingest_out = self.ingest_fn(source)
+            logger.info(f"Ingested {len(ingest_out.records)} records")
+
+            # 2) preprocess
+            preprocess_out = self.preprocess_fn(ingest_out.records, self.task)
+            logger.info(f"Preprocessed to {len(preprocess_out.examples)} examples")
+
+            # 3) model + tokenizer init
+            model, tokenizer = self.model_init_fn(model_name_or_path, **(model_init_kwargs or {}))
+            logger.info(f"Loaded model/tokenizer: {model_name_or_path}")
+
+            # 4) tokenize
+            tokenize_out = self.tokenize_fn(preprocess_out.examples, tokenizer, self.task, max_length=max_length or self.default_max_length)
+            logger.info(f"Tokenized into {len(tokenize_out.encodings)} tokenized examples")
+
+            # 5) prepare dataset (split)
+            dataset_out = self.prepare_dataset_fn(tokenize_out, split_ratio=split_ratio)
+            logger.info(f"Prepared dataset (train/eval): {bool(dataset_out.train_dataset)}/{bool(dataset_out.eval_dataset)}")
 
         # 6) data collator wrapper
         def collator(batch):
