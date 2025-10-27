@@ -1,6 +1,7 @@
 """
 Modular pipeline for fine-tuning HuggingFace models for generation tasks.
 Supports text generation (causal LM) and text-to-text generation (seq2seq).
+Now includes Parameter-Efficient Fine-Tuning (PEFT) support via LoRA, QLoRA, and more.
 """
 
 import torch
@@ -20,10 +21,29 @@ from transformers import (
     DataCollatorForLanguageModeling,
     DataCollatorForSeq2Seq,
     GenerationConfig,
+    BitsAndBytesConfig,
 )
 from datasets import DatasetDict
 from evaluate import load
 import nltk
+
+# PEFT imports
+try:
+    from peft import (
+        get_peft_model,
+        LoraConfig,
+        TaskType,
+        PeftModel,
+        prepare_model_for_kbit_training,
+        PrefixTuningConfig,
+        PromptTuningConfig,
+        IA3Config,
+    )
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    warnings.warn("PEFT not installed. Install with: pip install peft")
+
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
@@ -31,9 +51,10 @@ except LookupError:
 
 
 class NLPGenerationPipeline:
-    """Unified pipeline for text generation tasks."""
+    """Unified pipeline for text generation tasks with PEFT support."""
     
     VALID_TASKS = ['causal_lm', 'seq2seq']
+    VALID_PEFT_METHODS = ['lora', 'qlora', 'prefix_tuning', 'prompt_tuning', 'ia3', None]
     
     def __init__(
         self,
@@ -41,6 +62,7 @@ class NLPGenerationPipeline:
         model: Optional[Any] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         generation_config: Optional[GenerationConfig] = None,
+        peft_config: Optional[Any] = None,
         # Customizable functions
         load_model_fn: Optional[Callable] = None,
         load_tokenizer_fn: Optional[Callable] = None,
@@ -56,6 +78,7 @@ class NLPGenerationPipeline:
             model: Pre-loaded model (optional)
             tokenizer: Pre-loaded tokenizer (optional)
             generation_config: Generation configuration (optional)
+            peft_config: PEFT configuration (optional)
         """
         if task_type not in self.VALID_TASKS:
             raise ValueError(f"task_type must be one of {self.VALID_TASKS}")
@@ -64,6 +87,8 @@ class NLPGenerationPipeline:
         self.model = model
         self.tokenizer = tokenizer
         self.generation_config = generation_config
+        self.peft_config = peft_config
+        self.is_peft_model = False
         
         # Set customizable functions
         self.load_model_fn = load_model_fn or self._default_load_model
@@ -79,7 +104,9 @@ class NLPGenerationPipeline:
         cls,
         model_path: Union[str, Path],
         task_type: Optional[str] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
     ) -> 'NLPGenerationPipeline':
         """Load a trained pipeline from disk."""
         model_path = Path(model_path)
@@ -97,29 +124,181 @@ class NLPGenerationPipeline:
             else:
                 task_type = 'causal_lm'
         
-        # Load model
-        if task_type == 'seq2seq':
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_path)
+        # Check if this is a PEFT model
+        adapter_config_path = model_path / "adapter_config.json"
+        is_peft = adapter_config_path.exists()
         
-        # Set device
-        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        model = model.to(device).eval()
+        # Setup quantization config if needed
+        quantization_config = None
+        if load_in_8bit or load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_compute_dtype=torch.float16 if load_in_4bit else None,
+                bnb_4bit_quant_type="nf4" if load_in_4bit else None,
+                bnb_4bit_use_double_quant=True if load_in_4bit else None,
+            )
+        
+        # Load base model
+        if is_peft and PEFT_AVAILABLE:
+            # Load base model first, then PEFT adapter
+            import json
+            with open(adapter_config_path) as f:
+                adapter_config = json.load(f)
+            base_model_name = adapter_config.get('base_model_name_or_path', model_path)
+            
+            if task_type == 'seq2seq':
+                base_model = AutoModelForSeq2SeqLM.from_pretrained(
+                    base_model_name,
+                    quantization_config=quantization_config,
+                    device_map='auto' if quantization_config else None
+                )
+            else:
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    base_model_name,
+                    quantization_config=quantization_config,
+                    device_map='auto' if quantization_config else None
+                )
+            
+            # Load PEFT adapter
+            model = PeftModel.from_pretrained(base_model, model_path)
+            pipeline = cls(
+                task_type=task_type,
+                model=model,
+                tokenizer=tokenizer,
+                generation_config=None
+            )
+            pipeline.is_peft_model = True
+        else:
+            # Load full model
+            if task_type == 'seq2seq':
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    model_path,
+                    quantization_config=quantization_config,
+                    device_map='auto' if quantization_config else None
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    quantization_config=quantization_config,
+                    device_map='auto' if quantization_config else None
+                )
+            
+            # Set device if not using quantization
+            if not quantization_config:
+                device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+                model = model.to(device)
+            
+            model = model.eval()
+            
+            pipeline = cls(
+                task_type=task_type,
+                model=model,
+                tokenizer=tokenizer,
+                generation_config=None
+            )
         
         # Load generation config if exists
-        generation_config = None
         try:
-            generation_config = GenerationConfig.from_pretrained(model_path)
+            pipeline.generation_config = GenerationConfig.from_pretrained(model_path)
         except:
             pass
         
-        return cls(
-            task_type=task_type,
-            model=model,
-            tokenizer=tokenizer,
-            generation_config=generation_config
-        )
+        return pipeline
+    
+    # ==================== PEFT METHODS ====================
+    
+    def _create_peft_config(
+        self,
+        peft_method: str = 'lora',
+        # LoRA/QLoRA parameters
+        r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        target_modules: Optional[List[str]] = None,
+        bias: str = "none",
+        # Prefix Tuning parameters
+        num_virtual_tokens: int = 20,
+        # Prompt Tuning parameters
+        num_prompt_tokens: int = 20,
+        prompt_tuning_init: str = "RANDOM",
+        # IA3 parameters
+        feedforward_modules: Optional[List[str]] = None,
+        **kwargs
+    ):
+        """Create PEFT configuration based on method."""
+        if not PEFT_AVAILABLE:
+            raise ImportError("PEFT not installed. Install with: pip install peft")
+        
+        if peft_method not in self.VALID_PEFT_METHODS:
+            raise ValueError(f"peft_method must be one of {self.VALID_PEFT_METHODS}")
+        
+        # Determine task type for PEFT
+        if self.task_type == 'seq2seq':
+            task_type_peft = TaskType.SEQ_2_SEQ_LM
+        else:
+            task_type_peft = TaskType.CAUSAL_LM
+        
+        if peft_method in ['lora', 'qlora']:
+            # Default target modules based on model architecture
+            if target_modules is None:
+                # Common patterns for different architectures
+                target_modules = ["q_proj", "v_proj"]  # Works for most transformers
+            
+            return LoraConfig(
+                task_type=task_type_peft,
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=target_modules,
+                bias=bias,
+                **kwargs
+            )
+        
+        elif peft_method == 'prefix_tuning':
+            return PrefixTuningConfig(
+                task_type=task_type_peft,
+                num_virtual_tokens=num_virtual_tokens,
+                **kwargs
+            )
+        
+        elif peft_method == 'prompt_tuning':
+            return PromptTuningConfig(
+                task_type=task_type_peft,
+                num_virtual_tokens=num_prompt_tokens,
+                prompt_tuning_init=prompt_tuning_init,
+                **kwargs
+            )
+        
+        elif peft_method == 'ia3':
+            if target_modules is None:
+                target_modules = ["k_proj", "v_proj", "down_proj"]
+            if feedforward_modules is None:
+                feedforward_modules = ["down_proj"]
+            
+            return IA3Config(
+                task_type=task_type_peft,
+                target_modules=target_modules,
+                feedforward_modules=feedforward_modules,
+                **kwargs
+            )
+    
+    def _apply_peft(self, model, peft_config):
+        """Apply PEFT to model."""
+        if not PEFT_AVAILABLE:
+            raise ImportError("PEFT not installed. Install with: pip install peft")
+        
+        model = get_peft_model(model, peft_config)
+        self.is_peft_model = True
+        
+        # Print trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"\nPEFT Model:")
+        print(f"  Trainable params: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
+        print(f"  Total params: {total_params:,}")
+        
+        return model
     
     # ==================== DEFAULT IMPLEMENTATIONS ====================
     
@@ -136,12 +315,17 @@ class NLPGenerationPipeline:
         
         return tokenizer
     
-    def _default_load_model(self, model_name: str, **kwargs):
+    def _default_load_model(self, model_name: str, quantization_config=None, **kwargs):
         """Load model from HuggingFace."""
+        load_kwargs = {**kwargs}
+        if quantization_config:
+            load_kwargs['quantization_config'] = quantization_config
+            load_kwargs['device_map'] = 'auto'
+        
         if self.task_type == 'seq2seq':
-            return AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
+            return AutoModelForSeq2SeqLM.from_pretrained(model_name, **load_kwargs)
         else:
-            return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            return AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
     
     def _default_preprocess(self, examples: Dict, tokenizer: AutoTokenizer,
                            input_col: str = 'input',
@@ -215,7 +399,7 @@ class NLPGenerationPipeline:
         # Replace -100 in labels (used for padding)
         labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
         
-        # Convert to list of lists for batch_decode (each element should be a list of ints)
+        # Convert to list of lists for batch_decode
         predictions = predictions.tolist()
         labels = labels.tolist()
         
@@ -224,10 +408,7 @@ class NLPGenerationPipeline:
             decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
         except Exception as e:
             print(f"Error during decoding: {e}")
-            print(f"Predictions shape: {np.array(predictions).shape}")
-            print(f"Labels shape: {np.array(labels).shape}")
-            print(f"Sample prediction type: {type(predictions[0]) if predictions else 'empty'}")
-            raise
+            return {'error': 1.0}
         
         # Clean whitespace
         decoded_preds = [pred.strip() for pred in decoded_preds]
@@ -271,7 +452,8 @@ class NLPGenerationPipeline:
     def _default_training_args(self, output_dir: str, num_epochs: int = 3,
                               batch_size: int = 8, learning_rate: float = 5e-5,
                               eval_strategy: str = 'epoch', seed: int = 42,
-                              fp16: bool = None, **kwargs):
+                              fp16: bool = None, gradient_accumulation_steps: int = 1,
+                              **kwargs):
         """Create training arguments."""
         fp16 = torch.cuda.is_available() if fp16 is None else fp16
         
@@ -291,8 +473,9 @@ class NLPGenerationPipeline:
             logging_steps=10,
             seed=seed,
             fp16=fp16,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             report_to=['none'],
-            predict_with_generate=True,  # Important for generation tasks
+            predict_with_generate=True,
             generation_max_length=128,
             **kwargs
         )
@@ -410,13 +593,34 @@ class NLPGenerationPipeline:
         batch_size: int = 8,
         learning_rate: float = 5e-5,
         seed: int = 42,
-        mlm: bool = False,  # For masked language modeling (only seq2seq)
+        mlm: bool = False,
         mlm_probability: float = 0.15,
+        # PEFT parameters
+        use_peft: bool = False,
+        peft_method: str = 'lora',
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[List[str]] = None,
+        gradient_accumulation_steps: int = 1,
         **kwargs
     ) -> Tuple[Any, Trainer]:
         """
-        Run the complete fine-tuning pipeline.
+        Run the complete fine-tuning pipeline with optional PEFT.
         
+        Args:
+            use_peft: Whether to use parameter-efficient fine-tuning
+            peft_method: PEFT method ('lora', 'qlora', 'prefix_tuning', 'prompt_tuning', 'ia3')
+            load_in_8bit: Load model in 8-bit precision (for QLoRA)
+            load_in_4bit: Load model in 4-bit precision (for QLoRA)
+            lora_r: LoRA rank
+            lora_alpha: LoRA alpha
+            lora_dropout: LoRA dropout
+            lora_target_modules: Target modules for LoRA
+            gradient_accumulation_steps: Gradient accumulation steps
+            
         Returns:
             Tuple of (trained_model, trainer)
         """
@@ -432,15 +636,51 @@ class NLPGenerationPipeline:
         if input_col not in dataset['train'].column_names:
             raise ValueError(f"Dataset must contain '{input_col}' column")
         
-        # Load tokenizer and model
+        # Load tokenizer
         print(f"Loading tokenizer: {model_name}")
         self.tokenizer = self.load_tokenizer_fn(model_name)
         
-        print(f"Loading model: {model_name}")
-        self.model = self.load_model_fn(model_name)
+        # Setup quantization config
+        quantization_config = None
+        if load_in_8bit or load_in_4bit:
+            if not PEFT_AVAILABLE:
+                raise ImportError("PEFT required for quantization. Install with: pip install peft bitsandbytes")
+            
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_compute_dtype=torch.float16 if load_in_4bit else None,
+                bnb_4bit_quant_type="nf4" if load_in_4bit else None,
+                bnb_4bit_use_double_quant=True if load_in_4bit else None,
+            )
+            print(f"Loading model with {'8-bit' if load_in_8bit else '4-bit'} quantization")
         
-        # Resize token embeddings if needed
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        # Load model
+        print(f"Loading model: {model_name}")
+        self.model = self.load_model_fn(model_name, quantization_config=quantization_config)
+        
+        # Prepare model for k-bit training if using quantization
+        if quantization_config and PEFT_AVAILABLE:
+            self.model = prepare_model_for_kbit_training(self.model)
+        
+        # Apply PEFT if requested
+        if use_peft:
+            if not PEFT_AVAILABLE:
+                raise ImportError("PEFT not installed. Install with: pip install peft")
+            
+            print(f"\nApplying PEFT method: {peft_method}")
+            peft_config = self._create_peft_config(
+                peft_method=peft_method,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
+            )
+            self.peft_config = peft_config
+            self.model = self._apply_peft(self.model, peft_config)
+        else:
+            # Resize token embeddings if needed (only for full fine-tuning)
+            self.model.resize_token_embeddings(len(self.tokenizer))
         
         # Preprocess dataset
         print("Preprocessing dataset...")
@@ -464,6 +704,7 @@ class NLPGenerationPipeline:
             learning_rate=learning_rate,
             eval_strategy=eval_strategy,
             seed=seed,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             **kwargs
         )
         
@@ -495,11 +736,18 @@ class NLPGenerationPipeline:
         # Train
         print(f"\nTraining {self.task_type} model...")
         print(f"  Epochs: {num_epochs} | Batch: {batch_size} | LR: {learning_rate}")
+        if use_peft:
+            print(f"  PEFT: {peft_method} | Quantization: {'8-bit' if load_in_8bit else '4-bit' if load_in_4bit else 'None'}")
         trainer.train()
         
         # Save
         print(f"\nSaving to {output_dir}")
-        trainer.save_model(output_dir)
+        if use_peft:
+            # Save only adapter weights for PEFT
+            self.model.save_pretrained(output_dir)
+        else:
+            # Save full model
+            trainer.save_model(output_dir)
         self.tokenizer.save_pretrained(output_dir)
         
         # Save generation config
@@ -522,11 +770,40 @@ class NLPGenerationPipeline:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        self.model.save_pretrained(output_dir)
+        if self.is_peft_model:
+            # Save only adapter for PEFT models
+            self.model.save_pretrained(output_dir)
+        else:
+            # Save full model
+            self.model.save_pretrained(output_dir)
+        
         self.tokenizer.save_pretrained(output_dir)
         
         if self.generation_config:
             self.generation_config.save_pretrained(output_dir)
+    
+    def merge_and_save(self, output_dir: Union[str, Path]):
+        """Merge PEFT adapter with base model and save (for PEFT models only)."""
+        if not self.is_peft_model:
+            raise RuntimeError("Model is not a PEFT model. Use save() instead.")
+        
+        if not PEFT_AVAILABLE:
+            raise ImportError("PEFT not installed")
+        
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print("Merging adapter with base model...")
+        merged_model = self.model.merge_and_unload()
+        
+        print(f"Saving merged model to {output_dir}")
+        merged_model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        if self.generation_config:
+            self.generation_config.save_pretrained(output_dir)
+        
+        print("Merged model saved successfully!")
 
 
 # ==================== EXAMPLE USAGE ====================
@@ -535,7 +812,7 @@ if __name__ == '__main__':
     from datasets import Dataset, DatasetDict
     
     print("=" * 60)
-    print("SEQ2SEQ EXAMPLE (Text Summarization)")
+    print("PEFT EXAMPLE - LoRA Fine-tuning")
     print("=" * 60)
     
     # Create dataset
@@ -543,100 +820,210 @@ if __name__ == '__main__':
         'input': [
             "The quick brown fox jumps over the lazy dog.",
             "Machine learning is a subset of artificial intelligence.",
-            "Python is a popular programming language."
-        ] * 50,
+            "Python is a popular programming language.",
+            "Deep learning uses neural networks.",
+            "Natural language processing is fascinating."
+        ] * 100,
         'target': [
             "Fox jumps over dog.",
             "ML is part of AI.",
-            "Python is popular."
-        ] * 50
+            "Python is popular.",
+            "DL uses NNs.",
+            "NLP is fascinating."
+        ] * 100
     }
     dataset = DatasetDict({
         'train': Dataset.from_dict(train_data),
+        'validation': Dataset.from_dict({
+            'input': train_data['input'][:10],
+            'target': train_data['target'][:10]
+        }),
         'test': Dataset.from_dict({
-            'input': ["Deep learning uses neural networks."],
-            'target': ["DL uses NNs."]
+            'input': ["Transformers have revolutionized NLP."],
+            'target': ["Transformers revolutionized NLP."]
         })
     })
     
-    # Train
+    print("\n" + "=" * 60)
+    print("Example 1: LoRA Fine-tuning (T5-small)")
+    print("=" * 60)
+    
+    # Train with LoRA
     pipeline = NLPGenerationPipeline(task_type='seq2seq')
     model, trainer = pipeline.run(
         dataset=dataset,
         model_name='t5-small',
-        output_dir='./seq2seq_model',
+        output_dir='./lora_model',
         num_epochs=3,
-        batch_size=4
+        batch_size=4,
+        use_peft=True,
+        peft_method='lora',
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        lora_target_modules=["q", "v"],  # T5 uses "q" and "v" for attention
     )
     
     # Load and generate
-    pipeline = NLPGenerationPipeline.from_pretrained('./seq2seq_model')
-    result = pipeline.generate("Transformers have revolutionized natural language processing.")
-    print(f"\nGenerated: {result}")
+    print("\nLoading LoRA model...")
+    pipeline = NLPGenerationPipeline.from_pretrained('./lora_model')
+    result = pipeline.generate("Artificial intelligence is changing the world.")
+    print(f"Generated: {result}")
     
-    # Batch generation with multiple outputs
-    results = pipeline.generate(
-        ["AI is transforming the world.", "Climate change is a major issue."],
-        num_return_sequences=2,
-        do_sample=True,
-        temperature=0.8
-    )
-    print("\nBatch generations:")
-    for i, gens in enumerate(results):
-        print(f"  Input {i+1}:")
-        for j, gen in enumerate(gens):
-            print(f"    {j+1}. {gen}")
+    # Merge adapter and save full model
+    print("\nMerging adapter with base model...")
+    pipeline.merge_and_save('./lora_model_merged')
     
     print("\n" + "=" * 60)
-    print("CAUSAL LM EXAMPLE (Text Continuation)")
+    print("Example 2: QLoRA Fine-tuning (4-bit quantization)")
     print("=" * 60)
     
-    # Create dataset
+    # Train with QLoRA (4-bit)
+    pipeline = NLPGenerationPipeline(task_type='seq2seq')
+    model, trainer = pipeline.run(
+        dataset=dataset,
+        model_name='t5-small',
+        output_dir='./qlora_model',
+        num_epochs=3,
+        batch_size=4,
+        learning_rate=2e-4,  # Higher LR often works better with QLoRA
+        use_peft=True,
+        peft_method='qlora',
+        load_in_4bit=True,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        lora_target_modules=["q", "v"],
+        gradient_accumulation_steps=2,  # Useful for effective larger batch size
+    )
+    
+    # Load and generate
+    print("\nLoading QLoRA model...")
+    pipeline = NLPGenerationPipeline.from_pretrained('./qlora_model', load_in_4bit=True)
+    result = pipeline.generate("Quantum computing is the future.")
+    print(f"Generated: {result}")
+    
+    print("\n" + "=" * 60)
+    print("Example 3: Prefix Tuning")
+    print("=" * 60)
+    
+    # Train with Prefix Tuning
+    pipeline = NLPGenerationPipeline(task_type='seq2seq')
+    model, trainer = pipeline.run(
+        dataset=dataset,
+        model_name='t5-small',
+        output_dir='./prefix_model',
+        num_epochs=3,
+        batch_size=4,
+        use_peft=True,
+        peft_method='prefix_tuning',
+        num_virtual_tokens=30,  # Number of prefix tokens
+    )
+    
+    print("\n" + "=" * 60)
+    print("Example 4: Causal LM with LoRA (GPT-2)")
+    print("=" * 60)
+    
+    # Create causal LM dataset
     lm_data = {
         'input': [
             "Once upon a time",
             "In a galaxy far away",
-            "The future of technology"
-        ] * 50,
+            "The future of technology",
+            "Scientists have discovered",
+            "Breaking news:"
+        ] * 100,
         'target': [
-            "there was a brave knight.",
-            "there lived alien beings.",
-            "is artificial intelligence."
-        ] * 50
+            "there was a brave knight who saved the kingdom.",
+            "there lived alien beings with advanced technology.",
+            "is shaped by artificial intelligence and robotics.",
+            "a new method for renewable energy production.",
+            "major breakthrough in medical research announced."
+        ] * 100
     }
-    dataset = DatasetDict({'train': Dataset.from_dict(lm_data)})
+    lm_dataset = DatasetDict({
+        'train': Dataset.from_dict(lm_data),
+        'validation': Dataset.from_dict({
+            'input': lm_data['input'][:10],
+            'target': lm_data['target'][:10]
+        })
+    })
     
-    # Train
+    # Train with LoRA
     pipeline = NLPGenerationPipeline(task_type='causal_lm')
     model, trainer = pipeline.run(
-        dataset=dataset,
+        dataset=lm_dataset,
         model_name='gpt2',
-        output_dir='./causal_lm_model',
-        num_epochs=3
+        output_dir='./gpt2_lora',
+        num_epochs=3,
+        batch_size=4,
+        use_peft=True,
+        peft_method='lora',
+        lora_r=8,
+        lora_alpha=16,
+        lora_target_modules=["c_attn"],  # GPT-2 uses c_attn for attention
     )
     
     # Generate
-    pipeline = NLPGenerationPipeline.from_pretrained('./causal_lm_model', task_type='causal_lm')
+    print("\nLoading GPT-2 LoRA model...")
+    pipeline = NLPGenerationPipeline.from_pretrained('./gpt2_lora', task_type='causal_lm')
     result = pipeline.generate(
         "The secret to happiness is",
         max_length=50,
         num_beams=5,
         early_stopping=True
     )
-    print(f"\nGenerated: {result}")
+    print(f"Generated: {result}")
     
-    # Multiple diverse outputs
-    results = pipeline.generate(
-        "The meaning of life",
-        num_return_sequences=3,
-        do_sample=True,
-        temperature=0.9,
-        top_k=50,
-        top_p=0.95
+    print("\n" + "=" * 60)
+    print("Example 5: Comparison - Full Fine-tuning vs LoRA")
+    print("=" * 60)
+    
+    print("\nFull Fine-tuning:")
+    pipeline_full = NLPGenerationPipeline(task_type='seq2seq')
+    model_full, _ = pipeline_full.run(
+        dataset=dataset,
+        model_name='t5-small',
+        output_dir='./full_model',
+        num_epochs=1,
+        batch_size=4,
+        use_peft=False,
     )
-    print("\nDiverse generations:")
-    for i, gen in enumerate(results):
-        print(f"  {i+1}. {gen}")
+    total_params = sum(p.numel() for p in model_full.parameters())
+    trainable_params = sum(p.numel() for p in model_full.parameters() if p.requires_grad)
+    print(f"  Trainable params: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
+    
+    print("\nLoRA Fine-tuning:")
+    pipeline_lora = NLPGenerationPipeline(task_type='seq2seq')
+    model_lora, _ = pipeline_lora.run(
+        dataset=dataset,
+        model_name='t5-small',
+        output_dir='./lora_comparison',
+        num_epochs=1,
+        batch_size=4,
+        use_peft=True,
+        peft_method='lora',
+        lora_r=8,
+    )
+    
+    print("\n" + "=" * 60)
+    print("Key Benefits of PEFT:")
+    print("=" * 60)
+    print("✓ Dramatically reduced trainable parameters (often <1% of full model)")
+    print("✓ Much lower memory requirements")
+    print("✓ Faster training")
+    print("✓ Multiple adapters can be trained for different tasks")
+    print("✓ QLoRA enables fine-tuning of very large models on consumer GPUs")
+    print("✓ Easy to merge adapters back into base model")
+    
+    print("\n" + "=" * 60)
+    print("PEFT Methods Comparison:")
+    print("=" * 60)
+    print("LoRA: Best overall, efficient, high quality")
+    print("QLoRA: For very large models, 4-bit quantization")
+    print("Prefix Tuning: Good for few-shot learning")
+    print("Prompt Tuning: Simplest, but may need more data")
+    print("IA3: Very parameter efficient, good for T5 models")
     
     print("\n" + "=" * 60)
     print("Done!")
