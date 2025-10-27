@@ -516,7 +516,7 @@ class SFTPipelineTrainer:
         # 8) trainer init
         trainer_out = self.trainer_init_fn(
             model=model,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             train_dataset=dataset_out.train_dataset,
             eval_dataset=dataset_out.eval_dataset,
             sft_config=sft_config,
