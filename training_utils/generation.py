@@ -1,707 +1,555 @@
-"""
-Modified NLPGenerationPipeline to use TRL's SFTTrainer for supervised fine-tuning
-and optionally support PEFT (LoRA) adapters. Keeps the original pipeline's
-core features: seq2seq & causal-lm support, preprocessing, generation, saving,
-loading, metrics, and example usage.
+from __future__ import annotations
+import enum
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+import logging
 
-Notes:
-- This file tries to import `trl` and `peft` and will raise a helpful error if
-  they are not installed. Install with `pip install trl peft` (versions may
-  vary; consult library docs).
-- The code keeps backward compatibility if PEFT or TRL are not used.
-"""
-
+# Core libs (user must have installed these)
 import torch
-import numpy as np
-import warnings
-import pickle
-from pathlib import Path
-from typing import Dict, Tuple, Optional, Callable, Union, List, Any
+from torch.utils.data import Dataset
+from datasets import Dataset as HFDataset, DatasetDict
+from transformers import PreTrainedTokenizerBase, AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+from transformers.tokenization_utils_base import BatchEncoding
+from dataclasses import asdict
 
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
-    AutoConfig,
-    Seq2SeqTrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling,
-    DataCollatorForSeq2Seq,
-    GenerationConfig,
-)
-from datasets import DatasetDict
-from evaluate import load
-import nltk
+# TRL SFT trainer (user must install trl)
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
+    from trl import SFTTrainer
+except Exception as e:
+    SFTTrainer = None  # We'll raise if user tries to use it without trl
 
-# Optional imports: TRL SFTTrainer and PEFT
-try:
-    from trl import SFTTrainer, SFTTrainingArguments
-    _HAS_TRL = True
-except Exception:
-    SFTTrainer = None
-    SFTTrainingArguments = None
-    _HAS_TRL = False
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-try:
-    from peft import (
-        get_peft_model,
-        LoraConfig,
-        TaskType,
-        PeftConfig,
-        PeftModel,
-        prepare_model_for_kbit_training,
+
+# -----------------------------
+# Task type
+# -----------------------------
+class TaskType(enum.Enum):
+    LM = "lm"   # Standard Language Modeling (unconditional / causal LM)
+    CLM = "clm" # Conversational Language Modeling (conversation -> next token LM)
+    PC = "pc"   # Standard Prompt Completion (prompt + completion; mask prompt)
+    CPC = "cpc" # Conversational Prompt Completion (conversation + completion; mask conversation)
+
+
+# -----------------------------
+# Step I/O dataclasses (explicit shapes)
+# -----------------------------
+@dataclass
+class IngestOutput:
+    """
+    The ingestion step returns a list of raw records. A raw record is a dict,
+    but the schema depends on the task. Below are minimal allowed shapes:
+      - LM: {"text": "<raw text>"}
+      - CLM: {"conversation": [{"role": "user"|"assistant", "text": "<str>"}, ...], "id": Optional[str]}
+      - PC: {"prompt": "<str>", "completion": "<str>", "id": Optional[str]}
+      - CPC: {"conversation": [...], "completion": "<str>", "id": Optional[str]}
+    """
+    records: List[Dict[str, Any]]
+
+
+@dataclass
+class PreprocessOutput:
+    """
+    Preprocessing converts raw records into normalized examples.
+    Standard normalized example fields:
+      - "input": str  # text that will be presented to model as context/prompt
+      - "target": Optional[str]  # text that model should produce; None for pure LM
+      - "meta": Optional[Dict[str,Any]]  # original metadata (id, source)
+    """
+    examples: List[Dict[str, Any]]
+
+
+@dataclass
+class TokenizeOutput:
+    """
+    Tokenize step returns tokenized encodings (already truncated/padded as needed)
+    Each item is a dict containing keys like:
+      - "input_ids": List[int]
+      - "attention_mask": List[int]
+      - "labels": List[int] (for HuggingFace Trainer / SFTTrainer semantics; -100 where ignored)
+      - "meta": Optional[Dict]
+    """
+    encodings: List[Dict[str, Any]]
+
+
+@dataclass
+class DatasetOutput:
+    """
+    A wrapper around HF Dataset objects (train / eval)
+    """
+    train_dataset: Optional[HFDataset]
+    eval_dataset: Optional[HFDataset]
+
+
+@dataclass
+class TrainerOutput:
+    """
+    The object returned by trainer_init: contains the trainer and some metadata
+    """
+    trainer: Any  # SFTTrainer (from trl) or Transformers Trainer-like object
+    training_args: Optional[TrainingArguments] = None
+
+
+# -----------------------------
+# Default helper implementations
+# -----------------------------
+def default_ingest(source: Union[str, Iterable[Dict[str, Any]], HFDataset]) -> IngestOutput:
+    """
+    Default ingest:
+      - If `source` is a datasets.Dataset, convert to list of dicts.
+      - If `source` is an iterable of dicts, consume it.
+      - If `source` is a string, treat as a path to JSONL or plain text file:
+          * .jsonl -> parse lines as json records
+          * .txt  -> each line is a record {"text": line}
+    Returns IngestOutput(records=[...])
+    """
+    records = []
+    if isinstance(source, HFDataset):
+        records = [dict(r) for r in source]
+    elif isinstance(source, str):
+        import json, os
+        path = source
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Path not found: {path}")
+        if path.endswith(".jsonl") or path.endswith(".ndjson"):
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    records.append(json.loads(line))
+        elif path.endswith(".json"):
+            with open(path, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+                if isinstance(obj, list):
+                    records.extend(obj)
+                else:
+                    raise ValueError("JSON file must contain a list of records for default_ingest")
+        else:
+            # plain text -> each non-empty line is a record
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if s:
+                        records.append({"text": s})
+    else:
+        # assume iterable of dicts
+        records = list(source)
+    return IngestOutput(records=records)
+
+
+def default_preprocess(records: List[Dict[str, Any]], task: TaskType, conv_sep: str = "\n") -> PreprocessOutput:
+    """
+    Convert raw records into normalized {"input": str, "target": Optional[str], "meta": {...}}.
+    Default behaviors:
+      - LM: input = record["text"], target = None (whole sequence used as LM targets)
+      - PC: input = record["prompt"], target = record["completion"]
+      - CLM: build an interleaved string like "user: <u>\nassistant: <a>\n..."; target = None
+      - CPC: input = conversation string, target = record["completion"]
+    The user can provide their own preprocessing function to implement different formatting,
+    token special tokens, system messages, etc.
+    """
+    examples = []
+    for r in records:
+        meta = {"id": r.get("id")} if "id" in r else {}
+        if task == TaskType.LM:
+            text = r.get("text") or r.get("text", "")
+            examples.append({"input": text, "target": None, "meta": meta})
+        elif task == TaskType.PC:
+            prompt = r.get("prompt") or r.get("input") or ""
+            completion = r.get("completion") or r.get("target") or ""
+            examples.append({"input": prompt, "target": completion, "meta": meta})
+        elif task == TaskType.CLM:
+            # r["conversation"] expected as list of {"role": "user"|"assistant", "text": str}
+            conv = r.get("conversation", [])
+            conv_txt = []
+            for turn in conv:
+                role = turn.get("role", "user")
+                txt = turn.get("text", "")
+                conv_txt.append(f"{role}: {txt}")
+            input_str = conv_sep.join(conv_txt)
+            examples.append({"input": input_str, "target": None, "meta": meta})
+        elif task == TaskType.CPC:
+            conv = r.get("conversation", [])
+            conv_txt = []
+            for turn in conv:
+                role = turn.get("role", "user")
+                txt = turn.get("text", "")
+                conv_txt.append(f"{role}: {txt}")
+            input_str = conv_sep.join(conv_txt)
+            completion = r.get("completion") or ""
+            examples.append({"input": input_str, "target": completion, "meta": meta})
+        else:
+            raise ValueError(f"Unknown task: {task}")
+    return PreprocessOutput(examples=examples)
+
+
+def default_tokenize(
+    examples: List[Dict[str, Any]],
+    tokenizer: PreTrainedTokenizerBase,
+    task: TaskType,
+    max_length: Optional[int] = None,
+    padding: str = "longest",
+    truncation: bool = True,
+    return_tensors: Optional[str] = None,
+) -> TokenizeOutput:
+    """
+    Tokenize normalized examples to produce:
+      - input_ids, attention_mask
+      - labels: for LM -> copy input_ids (causal LM labels)
+                for PC/CPC -> labels are -100 for the prompt part, real ids for completion
+                for CLM -> labels = copy input_ids (like LM)
+    Note: This default uses simple concatenation: input + (separator) + target (if present).
+    For PC/CPC, we must be able to detect the boundary between prompt and completion to mask.
+    """
+    encodings = []
+    sep_token = tokenizer.eos_token or tokenizer.sep_token or ""
+    for ex in examples:
+        inp = ex["input"] or ""
+        tgt = ex.get("target")
+        if task in (TaskType.LM, TaskType.CLM):
+            # For plain LM, we train on the entire sequence as LM targets
+            text = inp
+            toks = tokenizer(text, truncation=truncation, padding=False)
+            input_ids = toks["input_ids"]
+            labels = input_ids.copy()
+        elif task in (TaskType.PC, TaskType.CPC):
+            # Join input + sep + target so that input is left-aligned and labels only on target
+            joined = inp + (sep_token if sep_token else "") + (tgt or "")
+            toks = tokenizer(joined, truncation=truncation, padding=False)
+            input_ids = toks["input_ids"]
+            # find boundary: tokenized prompt length
+            prompt_ids = tokenizer(inp + (sep_token if sep_token else ""), truncation=truncation, padding=False)["input_ids"]
+            prompt_len = len(prompt_ids)
+            labels = [-100] * prompt_len + input_ids[prompt_len:]
+            # If completion empty -> all -100 for labels (no training signal)
+            if len(labels) != len(input_ids):
+                # fallback safety: pad/truncate to same length
+                # align lengths
+                L = min(len(labels), len(input_ids))
+                labels = labels[:L]
+                input_ids = input_ids[:L]
+            # If no completion present, labels might be all -100 (valid)
+        else:
+            raise ValueError(f"Unknown task: {task}")
+
+        attention_mask = [1] * len(input_ids)
+        # Truncation/padding handled in batch collator; we return per-example lists
+        encodings.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "meta": ex.get("meta", {})})
+    return TokenizeOutput(encodings=encodings)
+
+
+class SimpleHFDataset(Dataset):
+    """Wrap tokenized encodings (lists) into a torch-friendly dataset"""
+    def __init__(self, encodings: List[Dict[str, Any]]):
+        self.encodings = encodings
+
+    def __len__(self):
+        return len(self.encodings)
+
+    def __getitem__(self, idx):
+        return self.encodings[idx]
+
+
+def default_prepare_dataset(tokenized: TokenizeOutput, split_ratio: float = 0.0) -> DatasetOutput:
+    """
+    Convert tokenized encodings to HF Dataset objects. By default, returns a
+    train-only dataset (no eval). If split_ratio > 0, a small eval split is created.
+    """
+    encs = tokenized.encodings
+    if split_ratio and 0.0 < split_ratio < 1.0:
+        n = len(encs)
+        n_eval = int(n * split_ratio)
+        eval_encs = encs[:n_eval]
+        train_encs = encs[n_eval:]
+    else:
+        train_encs = encs
+        eval_encs = None
+
+    # Build HF datasets
+    def to_hf(enc_list):
+        if enc_list is None:
+            return None
+        # Convert lists to dict of lists
+        keys = set(k for d in enc_list for k in d.keys())
+        out = {k: [] for k in keys}
+        for item in enc_list:
+            for k in keys:
+                out[k].append(item.get(k))
+        return HFDataset.from_dict(out)
+
+    train_ds = to_hf(train_encs)
+    eval_ds = to_hf(eval_encs) if eval_encs is not None else None
+    return DatasetOutput(train_dataset=train_ds, eval_dataset=eval_ds)
+
+
+def default_data_collator(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenizerBase) -> Dict[str, torch.Tensor]:
+    """
+    A minimal data collator that pads input_ids / labels to the longest in batch and returns tensors.
+    - labels are padded with -100 (so ignored by loss computation)
+    - input_ids / attention_mask padded with tokenizer.pad_token_id and 0
+    """
+    # Find max length
+    max_len = max(len(item["input_ids"]) for item in batch)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    padded_input_ids = []
+    padded_attention_mask = []
+    padded_labels = []
+
+    for item in batch:
+        ids = item["input_ids"]
+        att = item["attention_mask"]
+        labs = item["labels"]
+        # pad
+        l = len(ids)
+        pad_len = max_len - l
+        padded_input_ids.append(ids + [pad_id] * pad_len)
+        padded_attention_mask.append(att + [0] * pad_len)
+        # label pad with -100
+        padded_labels.append(labs + [-100] * pad_len)
+
+    return {
+        "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(padded_attention_mask, dtype=torch.long),
+        "labels": torch.tensor(padded_labels, dtype=torch.long),
+    }
+
+
+def default_model_init(model_name_or_path: str, device_map: Optional[dict] = None, **kwargs):
+    """
+    Initialize a causal LM model and tokenizer by name/path. Returns (model, tokenizer).
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        # set pad token to eos if not present (common with causal LM)
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.sep_token or "<|pad|>"
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+    if device_map:
+        # Optional user-provided device_map handling (e.g., accelerate-style)
+        model.to(device_map.get("device", torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+    return model, tokenizer
+
+
+def default_trainer_init(
+    model,
+    tokenizer: PreTrainedTokenizerBase,
+    train_dataset: Optional[HFDataset],
+    eval_dataset: Optional[HFDataset],
+    training_args: TrainingArguments,
+    data_collator: Callable[[List[Dict[str, Any]]], Dict[str, torch.Tensor]],
+    **kwargs
+) -> TrainerOutput:
+    """
+    Create a TRL SFTTrainer (preferred) if available, otherwise fall back to a Transformers Trainer.
+    Returns TrainerOutput(trainer=..., training_args=training_args)
+    """
+    if SFTTrainer is None:
+        raise RuntimeError("trl.SFTTrainer is not available. Please `pip install trl` to use the default_trainer_init.")
+
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        args=training_args,
+        data_collator=data_collator,
+        # user can pass additional kwargs like optimizers etc.
+        **kwargs,
     )
-    _HAS_PEFT = True
-except Exception:
-    get_peft_model = None
-    LoraConfig = None
-    TaskType = None
-    PeftConfig = None
-    PeftModel = None
-    prepare_model_for_kbit_training = None
-    _HAS_PEFT = False
+    return TrainerOutput(trainer=trainer, training_args=training_args)
 
 
-class NLPGenerationPipeline:
-    """Unified pipeline for text generation tasks with optional SFTTrainer/PEFT support."""
+# -----------------------------
+# Main pipeline class
+# -----------------------------
+class SFTPipelineTrainer:
+    """
+    A modular pipeline for SFT-style fine-tuning supporting LM, CLM, PC, CPC tasks.
 
-    VALID_TASKS = ['causal_lm', 'seq2seq']
+    Pipeline steps (default methods provided, but each can be replaced by supplying
+    a callable with the expected signature during initialization, or by calling
+    register_step()):
+
+      1. ingest(source) -> IngestOutput
+      2. preprocess(records, task) -> PreprocessOutput
+      3. tokenize(examples, tokenizer, task, ...) -> TokenizeOutput
+      4. prepare_dataset(tokenized, split_ratio) -> DatasetOutput
+      5. model_init(model_name_or_path, **kwargs) -> (model, tokenizer)
+      6. data_collator(batch) -> torch tensors
+      7. trainer_init(model, tokenizer, train_dataset, eval_dataset, training_args, data_collator) -> TrainerOutput
+      8. train(trainer, ...) -> training results
+      9. evaluate(trainer) -> metrics
+     10. save(trainer, path)
+
+    Usage:
+      pipeline = SFTPipelineTrainer(task=TaskType.PC)
+      pipeline.run(source="data.jsonl", model_name="gpt2", training_args=training_args)
+    """
 
     def __init__(
         self,
-        task_type: str = 'causal_lm',
-        model: Optional[Any] = None,
-        tokenizer: Optional[AutoTokenizer] = None,
-        generation_config: Optional[GenerationConfig] = None,
-        # Customizable functions
-        load_model_fn: Optional[Callable] = None,
-        load_tokenizer_fn: Optional[Callable] = None,
-        preprocess_fn: Optional[Callable] = None,
-        compute_metrics_fn: Optional[Callable] = None,
-        create_training_args_fn: Optional[Callable] = None,
-        # PEFT / SFT options
-        use_peft: bool = False,
-        peft_config: Optional[Dict] = None,
+        task: TaskType,
+        # Allow users to pass custom step implementations (callables)
+        ingest_fn: Optional[Callable[[Any], IngestOutput]] = None,
+        preprocess_fn: Optional[Callable[[List[Dict[str, Any]], TaskType], PreprocessOutput]] = None,
+        tokenize_fn: Optional[Callable[..., TokenizeOutput]] = None,
+        prepare_dataset_fn: Optional[Callable[[TokenizeOutput], DatasetOutput]] = None,
+        model_init_fn: Optional[Callable[..., Tuple[Any, PreTrainedTokenizerBase]]] = None,
+        data_collator_fn: Optional[Callable[[List[Dict[str, Any]]], Dict[str, torch.Tensor]]] = None,
+        trainer_init_fn: Optional[Callable[..., TrainerOutput]] = None,
+        train_fn: Optional[Callable[[Any], Any]] = None,
+        eval_fn: Optional[Callable[[Any], Dict[str, float]]] = None,
+        save_fn: Optional[Callable[[Any, str], None]] = None,
+        default_max_length: Optional[int] = None,
     ):
-        """
-        Initialize generation pipeline.
+        self.task = task
 
-        Args:
-            task_type: 'causal_lm' (GPT-style) or 'seq2seq' (T5-style)
-            model: Pre-loaded model (optional)
-            tokenizer: Pre-loaded tokenizer (optional)
-            generation_config: Generation configuration (optional)
-            use_peft: whether to enable PEFT/LoRA wrapping (optional)
-            peft_config: dict with LoRA config params (optional)
-        """
-        if task_type not in self.VALID_TASKS:
-            raise ValueError(f"task_type must be one of {self.VALID_TASKS}")
+        # bind functions: use defaults if not provided
+        self.ingest_fn = ingest_fn or default_ingest
+        self.preprocess_fn = preprocess_fn or default_preprocess
+        self.tokenize_fn = tokenize_fn or default_tokenize
+        self.prepare_dataset_fn = prepare_dataset_fn or default_prepare_dataset
+        self.model_init_fn = model_init_fn or default_model_init
+        self.data_collator_fn = data_collator_fn or default_data_collator
+        self.trainer_init_fn = trainer_init_fn or default_trainer_init
+        self.train_fn = train_fn or (lambda trainer: trainer.train())
+        self.eval_fn = eval_fn or (lambda trainer: trainer.evaluate() if hasattr(trainer, "evaluate") else {})
+        self.save_fn = save_fn or self._default_save
+        self.default_max_length = default_max_length
 
-        self.task_type = task_type
-        self.model = model
-        self.tokenizer = tokenizer
-        self.generation_config = generation_config
+    # Allow registering/overriding steps after init
+    def register_step(self, name: str, fn: Callable):
+        if not hasattr(self, f"{name}_fn"):
+            raise AttributeError(f"No such step to register: {name}")
+        setattr(self, f"{name}_fn", fn)
 
-        # Set customizable functions
-        self.load_model_fn = load_model_fn or self._default_load_model
-        self.load_tokenizer_fn = load_tokenizer_fn or self._default_load_tokenizer
-        self.preprocess_fn = preprocess_fn or self._default_preprocess
-        self.compute_metrics_fn = compute_metrics_fn or self._default_compute_metrics
-        self.create_training_args_fn = create_training_args_fn or self._default_training_args
-
-        # PEFT options
-        self.use_peft = use_peft
-        self.peft_config = peft_config or {}
-
-    # ==================== CLASS METHODS ====================
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: Union[str, Path],
-        task_type: Optional[str] = None,
-        device: Optional[str] = None,
-        use_peft: bool = False,
-    ) -> 'NLPGenerationPipeline':
-        """Load a trained pipeline from disk. If a PEFT adapter is present it will be loaded automatically when use_peft=True."""
-        model_path = Path(model_path)
-        if not model_path.exists():
-            raise ValueError(f"Model path does not exist: {model_path}")
-
-        # Load tokenizer and config
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        config = AutoConfig.from_pretrained(model_path)
-
-        # Auto-detect task type from config
-        if task_type is None:
-            if getattr(config, 'is_encoder_decoder', False):
-                task_type = 'seq2seq'
-            else:
-                task_type = 'causal_lm'
-
-        # Load model base
-        if task_type == 'seq2seq':
-            base_model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+    # Default save: uses trainer.save_model if available
+    def _default_save(self, trainer: Any, path: str):
+        if hasattr(trainer, "save_model"):
+            trainer.save_model(path)
+        elif hasattr(trainer, "model") and hasattr(trainer.model, "save_pretrained"):
+            trainer.model.save_pretrained(path)
         else:
-            base_model = AutoModelForCausalLM.from_pretrained(model_path)
+            raise RuntimeError("Unable to save model: trainer has no save_model or model.save_pretrained()")
 
-        # If PEFT is requested and peft adapter exists, try to load it
-        model = base_model
-        if use_peft and _HAS_PEFT:
-            try:
-                # If model_path contains a PEFT adapter, PeftModel.from_pretrained will load it
-                model = PeftModel.from_pretrained(base_model, model_path)
-            except Exception:
-                # no adapter found — keep base_model
-                model = base_model
-        
-        # Set device
-        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        model = model.to(device).eval()
-
-        # Load generation config if exists
-        generation_config = None
-        try:
-            generation_config = GenerationConfig.from_pretrained(model_path)
-        except Exception:
-            pass
-
-        return cls(
-            task_type=task_type,
-            model=model,
-            tokenizer=tokenizer,
-            generation_config=generation_config,
-            use_peft=use_peft,
-        )
-
-    # ==================== DEFAULT IMPLEMENTATIONS ====================
-
-    def _default_load_tokenizer(self, model_name: str, **kwargs) -> AutoTokenizer:
-        """Load tokenizer from HuggingFace."""
-        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
-
-        # Set pad token if not set
-        if tokenizer.pad_token is None:
-            if self.task_type == 'causal_lm':
-                tokenizer.pad_token = tokenizer.eos_token
-            else:
-                tokenizer.pad_token = tokenizer.eos_token or '<pad>'
-
-        return tokenizer
-
-    def _default_load_model(self, model_name: str, **kwargs):
-        """Load model from HuggingFace. Does not automatically apply PEFT.
-
-        If you want to enable PEFT at load time, pass use_peft=True to run().
-        """
-        if self.task_type == 'seq2seq':
-            return AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
-        else:
-            return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-
-    def _default_preprocess(
-        self,
-        examples: Dict,
-        tokenizer: AutoTokenizer,
-        input_col: str = 'input',
-        target_col: str = 'target',
-        max_input_length: int = 128,
-        max_target_length: int = 128,
-        **kwargs
-    ) -> Dict:
-        """Tokenize inputs and targets, and format examples for use with SFTTrainer."""
-        
-        records = []
-        for inp, tgt in zip(examples[input_col], examples.get(target_col, [None]*len(examples[input_col]))):
-            if self.task_type == 'causal_lm':
-                # Standard language modeling format: {"text": "..."}
-                if tgt is None:
-                    text = inp
-                else:
-                    text = inp + tgt
-                records.append({"text": text})
-            else:
-                # seq2seq or conversational format: conversational LM
-                # Use messages format: [{"role":"user","content":inp}, {"role":"assistant","content":tgt}]
-                if tgt is None:
-                    messages = [{"role": "user", "content": inp}]
-                else:
-                    messages = [
-                        {"role": "user", "content": inp},
-                        {"role": "assistant", "content": tgt}
-                    ]
-                records.append({"messages": messages})
-        
-        # Tokenise using tokenizer for each record
-        # we assume that SFTTrainer will handle tokenisation via text or messages
-        return records
-
-    def _default_compute_metrics(self, eval_pred):
-        """Compute evaluation metrics for generation."""
-        predictions, labels = eval_pred
-
-        # Handle predictions
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-
-        # Convert to numpy array and ensure correct shape
-        predictions = np.array(predictions)
-        labels = np.array(labels)
-
-        # For seq2seq models, predictions should be 2D: (batch_size, seq_length)
-        # If predictions is 3D, take argmax along last dimension
-        if predictions.ndim == 3:
-            predictions = np.argmax(predictions, axis=-1)
-
-        # Replace -100 in labels (used for padding)
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-
-        # Convert to list of lists for batch_decode (each element should be a list of ints)
-        predictions = predictions.tolist()
-        labels = labels.tolist()
-
-        try:
-            decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-            decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-        except Exception as e:
-            print(f"Error during decoding: {e}")
-            print(f"Predictions shape: {np.array(predictions).shape}")
-            print(f"Labels shape: {np.array(labels).shape}")
-            print(f"Sample prediction type: {type(predictions[0]) if predictions else 'empty'}")
-            raise
-
-        # Clean whitespace
-        decoded_preds = [pred.strip() for pred in decoded_preds]
-        decoded_labels = [label.strip() for label in decoded_labels]
-
-        # Compute metrics
-        metrics = {}
-
-        # ROUGE scores
-        try:
-            rouge = load('rouge')
-            rouge_results = rouge.compute(
-                predictions=decoded_preds,
-                references=decoded_labels,
-                use_stemmer=True
-            )
-            metrics.update({
-                'rouge1': rouge_results['rouge1'],
-                'rouge2': rouge_results['rouge2'],
-                'rougeL': rouge_results['rougeL']
-            })
-        except Exception as e:
-            print(f"Warning: Could not compute ROUGE: {e}")
-
-        # BLEU score
-        try:
-            bleu = load('bleu')
-            bleu_results = bleu.compute(
-                predictions=decoded_preds,
-                references=[[label] for label in decoded_labels]
-            )
-            metrics['bleu'] = bleu_results['bleu']
-        except Exception as e:
-            print(f"Warning: Could not compute BLEU: {e}")
-
-        # Average generation length
-        metrics['gen_len'] = np.mean([len(pred.split()) for pred in decoded_preds])
-
-        return metrics
-
-    def _default_training_args(self, output_dir: str, num_epochs: int = 3,
-                              batch_size: int = 8, learning_rate: float = 5e-5,
-                              eval_strategy: str = 'epoch', seed: int = 42,
-                              fp16: bool = None, **kwargs):
-        """Create training arguments. Uses SFTTrainingArguments if available, otherwise Seq2SeqTrainingArguments."""
-        fp16 = torch.cuda.is_available() if fp16 is None else fp16
-
-        if _HAS_TRL and SFTTrainingArguments is not None:
-            return SFTTrainingArguments(
-                output_dir=output_dir,
-                num_train_epochs=num_epochs,
-                per_device_train_batch_size=batch_size,
-                per_device_eval_batch_size=batch_size,
-                learning_rate=learning_rate,
-                weight_decay=0.01,
-                warmup_ratio=0.1,
-                evaluation_strategy=eval_strategy,
-                save_strategy=eval_strategy,
-                load_best_model_at_end=True,
-                metric_for_best_model='rougeL' if eval_strategy != 'no' else None,
-                greater_is_better=True,
-                logging_steps=10,
-                seed=seed,
-                fp16=fp16,
-                report_to=['none'],
-                predict_with_generate=True,
-                generation_max_length=128,
-                **kwargs
-            )
-        else:
-            # Fallback to Seq2SeqTrainingArguments for compatibility
-            return Seq2SeqTrainingArguments(
-                output_dir=output_dir,
-                num_train_epochs=num_epochs,
-                per_device_train_batch_size=batch_size,
-                per_device_eval_batch_size=batch_size,
-                learning_rate=learning_rate,
-                weight_decay=0.01,
-                warmup_ratio=0.1,
-                eval_strategy=eval_strategy,
-                save_strategy=eval_strategy,
-                load_best_model_at_end=True,
-                metric_for_best_model='rougeL' if eval_strategy != 'no' else None,
-                greater_is_better=True,
-                logging_steps=10,
-                seed=seed,
-                fp16=fp16,
-                report_to=['none'],
-                predict_with_generate=True,
-                generation_max_length=128,
-                **kwargs
-            )
-
-    # ==================== GENERATION ====================
-
-    def generate(
-        self,
-        text: Union[str, List[str]],
-        max_length: int = 128,
-        min_length: int = 10,
-        num_beams: int = 4,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 1.0,
-        do_sample: bool = False,
-        num_return_sequences: int = 1,
-        repetition_penalty: float = 1.0,
-        length_penalty: float = 1.0,
-        early_stopping: bool = True,
-        batch_size: int = 8,
-        **kwargs
-    ) -> Union[str, List[str], List[List[str]]]:
-        """
-        Generate text from input. Same semantics as before.
-        """
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model not loaded. Call run() or from_pretrained() first.")
-
-        is_single = isinstance(text, str)
-        texts = [text] if is_single else text
-
-        all_results = []
-
-        # Process in batches
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
-
-            inputs = self.tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors='pt'
-            )
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
-            self.model.eval()
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=max_length,
-                    min_length=min_length,
-                    num_beams=num_beams,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    do_sample=do_sample,
-                    num_return_sequences=num_return_sequences,
-                    repetition_penalty=repetition_penalty,
-                    length_penalty=length_penalty,
-                    early_stopping=early_stopping,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    **kwargs
-                )
-
-            # Decode outputs
-            generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
-            # Group by input if multiple sequences per input
-            if num_return_sequences > 1:
-                grouped = [
-                    generated_texts[j:j+num_return_sequences]
-                    for j in range(0, len(generated_texts), num_return_sequences)
-                ]
-                all_results.extend(grouped)
-            else:
-                all_results.extend(generated_texts)
-
-        if is_single:
-            return all_results[0]
-        return all_results
-
-    # ==================== TRAINING ====================
-
+    # Run end-to-end
     def run(
         self,
-        dataset: DatasetDict,
-        model_name: str = 'gpt2',
-        output_dir: str = None,
-        input_col: str = 'input',
-        target_col: str = 'target',
-        max_input_length: int = 128,
-        max_target_length: int = 128,
-        num_epochs: int = 3,
-        batch_size: int = 8,
-        learning_rate: float = 5e-5,
-        seed: int = 42,
-        mlm: bool = False,  # For masked language modeling (only seq2seq)
-        mlm_probability: float = 0.15,
-        use_peft: Optional[bool] = None,
-        peft_config: Optional[Dict] = None,
-        load_in_8bit: bool = False,
-        **kwargs
-    ) -> Tuple[Any, Any]:
+        source: Any,
+        model_name_or_path: str,
+        training_args: Optional[TrainingArguments] = None,
+        split_ratio: float = 0.0,
+        max_length: Optional[int] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
+        model_init_kwargs: Optional[Dict[str, Any]] = None,
+        data_collator_kwargs: Optional[Dict[str, Any]] = None,
+        save_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Run the complete fine-tuning pipeline. Uses TRL's SFTTrainer if available.
-
-        Returns:
-            Tuple of (trained_model, trainer)
+        Full pipeline orchestrator. Replaces any missing training_args with a simple default.
+        Returns a dict with keys:
+          - "trainer_output": TrainerOutput
+          - "train_result": training result (whatever trainer.train() returns)
+          - "eval_metrics": dict
         """
-        output_dir = output_dir or f'./{self.task_type}_model'
 
-        # Set seeds
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        trainer_kwargs = trainer_kwargs or {}
+        model_init_kwargs = model_init_kwargs or {}
+        data_collator_kwargs = data_collator_kwargs or {}
 
-        # Validate dataset
-        if 'train' not in dataset:
-            raise ValueError("Dataset must contain 'train' split")
-        if input_col not in dataset['train'].column_names:
-            raise ValueError(f"Dataset must contain '{input_col}' column")
+        # 1) ingest
+        ingest_out = self.ingest_fn(source)
+        logger.info(f"Ingested {len(ingest_out.records)} records")
 
-        # Load tokenizer and model
-        print(f"Loading tokenizer: {model_name}")
-        self.tokenizer = self.load_tokenizer_fn(model_name)
+        # 2) preprocess
+        preprocess_out = self.preprocess_fn(ingest_out.records, self.task)
+        logger.info(f"Preprocessed to {len(preprocess_out.examples)} examples")
 
-        print(f"Loading model: {model_name}")
-        model_load_kwargs = {}
-        if load_in_8bit:
-            model_load_kwargs['load_in_8bit'] = True
+        # 3) model + tokenizer init (needed before tokenization if using tokenizer)
+        model, tokenizer = self.model_init_fn(model_name_or_path, **(model_init_kwargs or {}))
+        logger.info(f"Loaded model/tokenizer: {model_name_or_path}")
 
-        self.model = self.load_model_fn(model_name, **model_load_kwargs)
+        # 4) tokenize
+        tokenize_out = self.tokenize_fn(preprocess_out.examples, tokenizer, self.task, max_length=max_length or self.default_max_length)
+        logger.info(f"Tokenized into {len(tokenize_out.encodings)} tokenized examples")
 
-        # Resize token embeddings if needed
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        # 5) prepare dataset (split)
+        dataset_out = self.prepare_dataset_fn(tokenize_out, split_ratio=split_ratio)
+        logger.info(f"Prepared dataset (train/eval): {bool(dataset_out.train_dataset)}/{bool(dataset_out.eval_dataset)}")
 
-        # Optionally prepare and wrap model for PEFT
-        use_peft = self.use_peft if use_peft is None else use_peft
-        peft_config = peft_config or self.peft_config or {}
+        # 6) data collator (wrap to pass tokenizer by default)
+        def collator(batch):
+            return (self.data_collator_fn(batch, tokenizer) if self.data_collator_fn.__code__.co_argcount >= 2 else self.data_collator_fn(batch))
+        # Note: above handles both signatures data_collator(batch, tokenizer) or data_collator(batch)
 
-        if use_peft:
-            if not _HAS_PEFT:
-                raise RuntimeError("PEFT requested but `peft` package is not installed. Install it with `pip install peft`.")
-
-            # If model is loaded in 8-bit we might need to prepare it
-            try:
-                if load_in_8bit and prepare_model_for_kbit_training is not None:
-                    self.model = prepare_model_for_kbit_training(self.model)
-            except Exception as e:
-                print(f"Warning: could not run prepare_model_for_kbit_training: {e}")
-
-            # Build LoRA config with sensible defaults if not provided
-            lora_config = LoraConfig(
-                r=peft_config.get('r', 8),
-                lora_alpha=peft_config.get('lora_alpha', 32),
-                target_modules=peft_config.get('target_modules', None),
-                lora_dropout=peft_config.get('lora_dropout', 0.05),
-                bias=peft_config.get('bias', 'none'),
-                task_type=peft_config.get('task_type', TaskType.CAUSAL_LM if self.task_type == 'causal_lm' else TaskType.SEQ_2_SEQ_LM),
+        # 7) training arguments default
+        if training_args is None:
+            # Provide a sensible default. Users should pass in their own TrainingArguments for real runs.
+            training_args = TrainingArguments(
+                output_dir="./sft_output",
+                per_device_train_batch_size=8,
+                gradient_accumulation_steps=1,
+                num_train_epochs=1,
+                logging_steps=10,
+                fp16=torch.cuda.is_available(),
+                save_strategy="epoch",
+                evaluation_strategy="no",
             )
 
-            # Wrap model
-            self.model = get_peft_model(self.model, lora_config)
-            print("Wrapped model with PEFT LoRA adapter")
-
-        # Preprocess dataset
-        print("Preprocessing dataset...")
-        processed_dataset = dataset.map(
-            lambda examples: self.preprocess_fn(
-                examples, self.tokenizer, input_col, target_col,
-                max_input_length, max_target_length
-            ),
-            batched=True,
-            remove_columns=dataset['train'].column_names
+        # 8) trainer init
+        trainer_out = self.trainer_init_fn(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=dataset_out.train_dataset,
+            eval_dataset=dataset_out.eval_dataset,
+            training_args=training_args,
+            data_collator=collator,
+            **(trainer_kwargs or {}),
         )
+        logger.info("Trainer initialized")
 
-        # Create training arguments
-        has_eval = 'validation' in dataset or 'test' in dataset
-        eval_strategy = 'epoch' if has_eval else 'no'
+        # 9) train
+        train_result = self.train_fn(trainer_out.trainer)
+        logger.info("Training complete")
 
-        training_args = self.create_training_args_fn(
-            output_dir=output_dir,
-            num_epochs=num_epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            eval_strategy=eval_strategy,
-            seed=seed,
-            **kwargs
-        )
-
-        # Create data collator
-        if self.task_type == 'seq2seq':
-            data_collator = DataCollatorForSeq2Seq(
-                self.tokenizer,
-                model=self.model,
-                padding=True
-            )
+        # 10) eval
+        eval_metrics = {}
+        if dataset_out.eval_dataset is not None:
+            eval_metrics = self.eval_fn(trainer_out.trainer)
+            logger.info("Evaluation complete")
         else:
-            data_collator = DataCollatorForLanguageModeling(
-                self.tokenizer,
-                mlm=mlm,
-                mlm_probability=mlm_probability
-            )
+            logger.info("No eval dataset provided; skip evaluation")
 
-        # Create trainer: prefer SFTTrainer if available
-        eval_dataset = processed_dataset.get('validation') or processed_dataset.get('test')
+        # 11) save
+        if save_path:
+            self.save_fn(trainer_out.trainer, save_path)
+            logger.info(f"Saved model to {save_path}")
 
-        if _HAS_TRL and SFTTrainer is not None:
-            trainer = SFTTrainer(
-                model=self.model,
-                args=training_args,
-                train_dataset=processed_dataset['train'],
-                eval_dataset=eval_dataset,
-                tokenizer=self.tokenizer,
-                data_collator=data_collator,
-                compute_metrics=self.compute_metrics_fn if eval_dataset is not None else None,
-            )
-            print("Using TRL SFTTrainer for training")
-        else:
-            # Fallback to vanilla Trainer
-            trainer = Trainer(
-                model=self.model,
-                args=training_args,
-                train_dataset=processed_dataset['train'],
-                eval_dataset=eval_dataset,
-                compute_metrics=self.compute_metrics_fn if eval_dataset is not None else None,
-                data_collator=data_collator,
-                tokenizer=self.tokenizer,
-            )
-            print("TRL not available — falling back to HuggingFace Trainer")
-
-        # Train
-        print(f"\nTraining {self.task_type} model...")
-        print(f"  Epochs: {num_epochs} | Batch: {batch_size} | LR: {learning_rate}")
-        trainer.train()
-
-        # Save
-        print(f"\nSaving to {output_dir}")
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # If PEFT, use save_pretrained on the peft model wrapper
-        if use_peft and _HAS_PEFT and isinstance(self.model, PeftModel):
-            # Save base model and adapter
-            base_model_dir = output_dir / 'base_model'
-            base_model_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Saving base model to {base_model_dir}")
-            # Save the underlying base model
-            self.model.base_model.save_pretrained(base_model_dir)
-            self.tokenizer.save_pretrained(base_model_dir)
-
-            # Save adapter to output_dir (PeftModel.save_pretrained writes adapter config)
-            print(f"Saving PEFT adapter to {output_dir}")
-            self.model.save_pretrained(output_dir)
-        else:
-            # Standard save
-            self.model.save_pretrained(output_dir)
-            self.tokenizer.save_pretrained(output_dir)
-
-        # Save generation config
-        if self.generation_config:
-            self.generation_config.save_pretrained(output_dir)
-
-        # Test evaluation
-        if 'test' in processed_dataset:
-            print("\nEvaluating on test set...")
-            test_results = trainer.evaluate(processed_dataset['test'])
-            print(f"Test results: {test_results}")
-
-        return self.model, trainer
-
-    def save(self, output_dir: Union[str, Path]):
-        """Save model and tokenizer. Handles PEFT-wrapped models properly."""
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("No model to save")
-
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if _HAS_PEFT and isinstance(self.model, PeftModel):
-            # Save base model and adapter
-            base_model_dir = output_dir / 'base_model'
-            base_model_dir.mkdir(parents=True, exist_ok=True)
-            self.model.base_model.save_pretrained(base_model_dir)
-            self.tokenizer.save_pretrained(base_model_dir)
-            self.model.save_pretrained(output_dir)
-        else:
-            self.model.save_pretrained(output_dir)
-            self.tokenizer.save_pretrained(output_dir)
+        return {"trainer_output": trainer_out, "train_result": train_result, "eval_metrics": eval_metrics}
 
 
-# ==================== EXAMPLE USAGE ====================
+# -----------------------------
+# Example: custom preprocess override
+# -----------------------------
+if __name__ == "__main__":
+    # Example: how to override preprocess for instruction-style prompts
+    def my_preprocess(records, task):
+        examples = []
+        for r in records:
+            if task in (TaskType.PC, ):
+                # convert to "Instruction: <prompt>\nResponse:" format
+                prompt = r["prompt"]
+                comp = r.get("completion", "")
+                input_txt = f"Instruction: {prompt}\nResponse:"
+                examples.append({"input": input_txt, "target": comp, "meta": {"id": r.get("id")}})
+            else:
+                # fallback to default
+                examples.append({"input": r.get("text", ""), "target": None, "meta": {}})
+        return PreprocessOutput(examples=examples)
 
-if __name__ == '__main__':
-    from datasets import Dataset, DatasetDict
+    # usage (pseudocode; user must supply actual TrainingArguments and model)
+    # pipeline = SFTPipelineTrainer(task=TaskType.PC, preprocess_fn=my_preprocess)
+    # pipeline.run(source="data.jsonl", model_name_or_path="gpt2", training_args=training_args, save_path="./out")
 
-    print("=" * 60)
-    print("SEQ2SEQ EXAMPLE (Text Summarization)")
-    print("=" * 60)
-
-    # Create dataset
-    train_data = {
-        'input': [
-            "The quick brown fox jumps over the lazy dog.",
-            "Machine learning is a subset of artificial intelligence.",
-            "Python is a popular programming language."
-        ] * 50,
-        'target': [
-            "Fox jumps over dog.",
-            "ML is part of AI.",
-            "Python is popular."
-        ] * 50
-    }
-    dataset = DatasetDict({
-        'train': Dataset.from_dict(train_data),
-        'test': Dataset.from_dict({
-            'input': ["Deep learning uses neural networks."],
-            'target': ["DL uses NNs."]
-        })
-    })
-
-    # Train
-    pipeline = NLPGenerationPipeline(task_type='seq2seq')
-    model, trainer = pipeline.run(
-        dataset=dataset,
-        model_name='t5-small',
-        output_dir='./seq2seq_model',
-        num_epochs=1,
-        batch_size=4,
-        # To enable PEFT set use_peft=True and optionally pass peft_config
-        use_peft=False,
-    )
-
-    # Load and generate
-    pipeline = NLPGenerationPipeline.from_pretrained('./seq2seq_model')
-    result = pipeline.generate("Transformers have revolutionized natural language processing.")
-    print(f"\nGenerated: {result}")
-
-    print("\n" + "=" * 60)
-    print("Done!")
-    print("=" * 60)
+    pass
