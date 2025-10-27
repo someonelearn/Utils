@@ -476,7 +476,7 @@ class NLPGenerationPipeline:
             gradient_accumulation_steps=gradient_accumulation_steps,
             report_to=['none'],
             predict_with_generate=True,
-            generation_max_length=128,
+            generation_max_length=32,
             **kwargs
         )
     
