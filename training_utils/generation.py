@@ -203,7 +203,7 @@ class NLPGenerationPipeline:
         else:
             return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
-        def _default_preprocess(
+    def _default_preprocess(
         self,
         examples: Dict,
         tokenizer: AutoTokenizer,
