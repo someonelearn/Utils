@@ -1,6 +1,7 @@
 """
 Modular pipeline for fine-tuning HuggingFace models for generation tasks.
 Supports text generation (causal LM) and text-to-text generation (seq2seq).
+Enhanced with PEFT (LoRA) and SFTTrainer support.
 """
 
 import torch
@@ -16,6 +17,7 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoConfig,
     Seq2SeqTrainingArguments,
+    TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
     DataCollatorForSeq2Seq,
@@ -23,6 +25,29 @@ from transformers import (
 )
 from datasets import DatasetDict
 from evaluate import load
+
+# PEFT imports
+try:
+    from peft import (
+        LoraConfig,
+        TaskType,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+        PeftModel,
+    )
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    warnings.warn("PEFT not installed. Install with: pip install peft")
+
+# TRL imports for SFTTrainer
+try:
+    from trl import SFTTrainer
+    TRL_AVAILABLE = True
+except ImportError:
+    TRL_AVAILABLE = False
+    warnings.warn("TRL not installed. Install with: pip install trl")
+
 import nltk
 try:
     nltk.data.find('tokenizers/punkt')
@@ -31,7 +56,7 @@ except LookupError:
 
 
 class NLPGenerationPipeline:
-    """Unified pipeline for text generation tasks."""
+    """Unified pipeline for text generation tasks with PEFT support."""
     
     VALID_TASKS = ['causal_lm', 'seq2seq']
     
@@ -41,6 +66,8 @@ class NLPGenerationPipeline:
         model: Optional[Any] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         generation_config: Optional[GenerationConfig] = None,
+        use_peft: bool = False,
+        peft_config: Optional[Dict] = None,
         # Customizable functions
         load_model_fn: Optional[Callable] = None,
         load_tokenizer_fn: Optional[Callable] = None,
@@ -56,6 +83,8 @@ class NLPGenerationPipeline:
             model: Pre-loaded model (optional)
             tokenizer: Pre-loaded tokenizer (optional)
             generation_config: Generation configuration (optional)
+            use_peft: Whether to use PEFT (LoRA) for efficient fine-tuning
+            peft_config: PEFT configuration dictionary
         """
         if task_type not in self.VALID_TASKS:
             raise ValueError(f"task_type must be one of {self.VALID_TASKS}")
@@ -64,6 +93,9 @@ class NLPGenerationPipeline:
         self.model = model
         self.tokenizer = tokenizer
         self.generation_config = generation_config
+        self.use_peft = use_peft
+        self.peft_config = peft_config or {}
+        self.is_peft_model = False
         
         # Set customizable functions
         self.load_model_fn = load_model_fn or self._default_load_model
@@ -79,7 +111,8 @@ class NLPGenerationPipeline:
         cls,
         model_path: Union[str, Path],
         task_type: Optional[str] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        is_peft: bool = False,
     ) -> 'NLPGenerationPipeline':
         """Load a trained pipeline from disk."""
         model_path = Path(model_path)
@@ -88,20 +121,41 @@ class NLPGenerationPipeline:
         
         # Load tokenizer and config
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        config = AutoConfig.from_pretrained(model_path)
         
-        # Auto-detect task type from config
-        if task_type is None:
-            if config.is_encoder_decoder:
-                task_type = 'seq2seq'
-            else:
-                task_type = 'causal_lm'
+        # Check if PEFT adapter exists
+        adapter_config_path = model_path / "adapter_config.json"
+        is_peft = is_peft or adapter_config_path.exists()
         
-        # Load model
-        if task_type == 'seq2seq':
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+        if is_peft:
+            if not PEFT_AVAILABLE:
+                raise ImportError("PEFT is required to load PEFT models. Install with: pip install peft")
+            
+            # Load base model first
+            config = AutoConfig.from_pretrained(model_path)
+            if task_type is None:
+                task_type = 'seq2seq' if config.is_encoder_decoder else 'causal_lm'
+            
+            # For PEFT models, we need to find the base model
+            # Try loading from the same directory or adapter_model directory
+            try:
+                if task_type == 'seq2seq':
+                    base_model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+                else:
+                    base_model = AutoModelForCausalLM.from_pretrained(model_path)
+                model = PeftModel.from_pretrained(base_model, model_path)
+            except:
+                # If that fails, model_path should point to adapter, need base_model_name_or_path
+                raise ValueError("For PEFT models, ensure base model is saved or provide base_model path")
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_path)
+            # Regular model loading
+            config = AutoConfig.from_pretrained(model_path)
+            if task_type is None:
+                task_type = 'seq2seq' if config.is_encoder_decoder else 'causal_lm'
+            
+            if task_type == 'seq2seq':
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(model_path)
         
         # Set device
         device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -114,12 +168,16 @@ class NLPGenerationPipeline:
         except:
             pass
         
-        return cls(
+        pipeline = cls(
             task_type=task_type,
             model=model,
             tokenizer=tokenizer,
-            generation_config=generation_config
+            generation_config=generation_config,
+            use_peft=is_peft,
         )
+        pipeline.is_peft_model = is_peft
+        
+        return pipeline
     
     # ==================== DEFAULT IMPLEMENTATIONS ====================
     
@@ -271,30 +329,74 @@ class NLPGenerationPipeline:
     def _default_training_args(self, output_dir: str, num_epochs: int = 3,
                               batch_size: int = 8, learning_rate: float = 5e-5,
                               eval_strategy: str = 'epoch', seed: int = 42,
-                              fp16: bool = None, **kwargs):
+                              fp16: bool = None, use_sft: bool = False,
+                              **kwargs):
         """Create training arguments."""
         fp16 = torch.cuda.is_available() if fp16 is None else fp16
         
-        return Seq2SeqTrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            weight_decay=0.01,
-            warmup_ratio=0.1,
-            eval_strategy=eval_strategy,
-            save_strategy=eval_strategy,
-            load_best_model_at_end=True,
-            metric_for_best_model='rougeL' if eval_strategy != 'no' else None,
-            greater_is_better=True,
-            logging_steps=10,
-            seed=seed,
-            fp16=fp16,
-            report_to=['none'],
-            predict_with_generate=True,  # Important for generation tasks
-            **kwargs
-        )
+        # Use regular TrainingArguments for SFTTrainer
+        args_class = TrainingArguments if use_sft else Seq2SeqTrainingArguments
+        
+        base_args = {
+            'output_dir': output_dir,
+            'num_train_epochs': num_epochs,
+            'per_device_train_batch_size': batch_size,
+            'per_device_eval_batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'weight_decay': 0.01,
+            'warmup_ratio': 0.1,
+            'eval_strategy': eval_strategy,
+            'save_strategy': eval_strategy,
+            'load_best_model_at_end': True,
+            'logging_steps': 10,
+            'seed': seed,
+            'fp16': fp16,
+            'report_to': ['none'],
+        }
+        
+        # Add metric for best model if evaluation is enabled
+        if eval_strategy != 'no':
+            base_args['metric_for_best_model'] = 'rougeL'
+            base_args['greater_is_better'] = True
+        
+        # Add predict_with_generate for Seq2Seq
+        if not use_sft:
+            base_args['predict_with_generate'] = True
+        
+        base_args.update(kwargs)
+        return args_class(**base_args)
+    
+    def _create_peft_config(self) -> 'LoraConfig':
+        """Create PEFT (LoRA) configuration."""
+        if not PEFT_AVAILABLE:
+            raise ImportError("PEFT is required for PEFT training. Install with: pip install peft")
+        
+        # Default PEFT config
+        default_config = {
+            'r': 8,  # LoRA rank
+            'lora_alpha': 16,  # LoRA alpha
+            'lora_dropout': 0.1,
+            'bias': 'none',
+            'task_type': TaskType.SEQ_2_SEQ_LM if self.task_type == 'seq2seq' else TaskType.CAUSAL_LM,
+            'target_modules': None,  # Auto-detect
+        }
+        
+        # Merge with user config
+        config = {**default_config, **self.peft_config}
+        
+        return LoraConfig(**config)
+    
+    def _prepare_sft_dataset(self, dataset: DatasetDict, input_col: str, target_col: str):
+        """Prepare dataset for SFTTrainer by combining input and target."""
+        def format_example(example):
+            # Format as instruction-response pairs
+            if target_col in example:
+                return {'text': f"Input: {example[input_col]}\nOutput: {example[target_col]}"}
+            else:
+                return {'text': example[input_col]}
+        
+        formatted_dataset = dataset.map(format_example, remove_columns=dataset['train'].column_names)
+        return formatted_dataset
     
     # ==================== GENERATION ====================
     
@@ -411,15 +513,30 @@ class NLPGenerationPipeline:
         seed: int = 42,
         mlm: bool = False,  # For masked language modeling (only seq2seq)
         mlm_probability: float = 0.15,
+        use_sft: bool = False,  # Use SFTTrainer
+        max_seq_length: int = 512,  # For SFTTrainer
+        packing: bool = False,  # For SFTTrainer
         **kwargs
-    ) -> Tuple[Any, Trainer]:
+    ) -> Tuple[Any, Union[Trainer, 'SFTTrainer']]:
         """
         Run the complete fine-tuning pipeline.
         
+        Args:
+            use_sft: Whether to use SFTTrainer (recommended for causal LM with PEFT)
+            max_seq_length: Maximum sequence length for SFTTrainer
+            packing: Whether to pack multiple samples in SFTTrainer
+            
         Returns:
             Tuple of (trained_model, trainer)
         """
         output_dir = output_dir or f'./{self.task_type}_model'
+        
+        # Validate SFT requirements
+        if use_sft:
+            if not TRL_AVAILABLE:
+                raise ImportError("TRL is required for SFTTrainer. Install with: pip install trl")
+            if self.task_type == 'seq2seq':
+                warnings.warn("SFTTrainer is designed for causal LM. Consider use_sft=False for seq2seq.")
         
         # Set seeds
         torch.manual_seed(seed)
@@ -441,16 +558,13 @@ class NLPGenerationPipeline:
         # Resize token embeddings if needed
         self.model.resize_token_embeddings(len(self.tokenizer))
         
-        # Preprocess dataset
-        print("Preprocessing dataset...")
-        processed_dataset = dataset.map(
-            lambda examples: self.preprocess_fn(
-                examples, self.tokenizer, input_col, target_col,
-                max_input_length, max_target_length
-            ),
-            batched=True,
-            remove_columns=dataset['train'].column_names
-        )
+        # Apply PEFT if enabled
+        if self.use_peft:
+            print("Applying PEFT (LoRA)...")
+            peft_config = self._create_peft_config()
+            self.model = get_peft_model(self.model, peft_config)
+            self.model.print_trainable_parameters()
+            self.is_peft_model = True
         
         # Create training arguments
         has_eval = 'validation' in dataset or 'test' in dataset
@@ -463,52 +577,87 @@ class NLPGenerationPipeline:
             learning_rate=learning_rate,
             eval_strategy=eval_strategy,
             seed=seed,
+            use_sft=use_sft,
             **kwargs
         )
         
-        # Create data collator
-        if self.task_type == 'seq2seq':
-            data_collator = DataCollatorForSeq2Seq(
-                self.tokenizer,
+        # Prepare dataset and trainer
+        if use_sft:
+            # Use SFTTrainer
+            print("Using SFTTrainer for supervised fine-tuning...")
+            formatted_dataset = self._prepare_sft_dataset(dataset, input_col, target_col)
+            
+            trainer = SFTTrainer(
                 model=self.model,
-                padding=True
+                args=training_args,
+                train_dataset=formatted_dataset['train'],
+                eval_dataset=formatted_dataset.get('validation') or formatted_dataset.get('test'),
+                tokenizer=self.tokenizer,
+                dataset_text_field='text',
+                max_seq_length=max_seq_length,
+                packing=packing,
             )
         else:
-            data_collator = DataCollatorForLanguageModeling(
-                self.tokenizer,
-                mlm=mlm,
-                mlm_probability=mlm_probability
+            # Use regular Trainer
+            print("Preprocessing dataset...")
+            processed_dataset = dataset.map(
+                lambda examples: self.preprocess_fn(
+                    examples, self.tokenizer, input_col, target_col,
+                    max_input_length, max_target_length
+                ),
+                batched=True,
+                remove_columns=dataset['train'].column_names
             )
-        
-        # Create trainer
-        eval_dataset = processed_dataset.get('validation') or processed_dataset.get('test')
-        trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=processed_dataset['train'],
-            eval_dataset=eval_dataset,
-            compute_metrics=self.compute_metrics_fn if eval_dataset else None,
-            data_collator=data_collator,
-        )
+            
+            # Create data collator
+            if self.task_type == 'seq2seq':
+                data_collator = DataCollatorForSeq2Seq(
+                    self.tokenizer,
+                    model=self.model,
+                    padding=True
+                )
+            else:
+                data_collator = DataCollatorForLanguageModeling(
+                    self.tokenizer,
+                    mlm=mlm,
+                    mlm_probability=mlm_probability
+                )
+            
+            eval_dataset = processed_dataset.get('validation') or processed_dataset.get('test')
+            trainer = Trainer(
+                model=self.model,
+                args=training_args,
+                train_dataset=processed_dataset['train'],
+                eval_dataset=eval_dataset,
+                compute_metrics=self.compute_metrics_fn if eval_dataset else None,
+                data_collator=data_collator,
+            )
         
         # Train
         print(f"\nTraining {self.task_type} model...")
+        print(f"  PEFT: {self.use_peft} | SFT: {use_sft}")
         print(f"  Epochs: {num_epochs} | Batch: {batch_size} | LR: {learning_rate}")
         trainer.train()
         
         # Save
         print(f"\nSaving to {output_dir}")
-        trainer.save_model(output_dir)
-        self.tokenizer.save_pretrained(output_dir)
+        if self.use_peft:
+            # Save PEFT adapter
+            self.model.save_pretrained(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
+        else:
+            trainer.save_model(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
         
         # Save generation config
         if self.generation_config:
             self.generation_config.save_pretrained(output_dir)
         
         # Test evaluation
-        if 'test' in processed_dataset:
+        if not use_sft and 'test' in (processed_dataset if not use_sft else formatted_dataset):
             print("\nEvaluating on test set...")
-            test_results = trainer.evaluate(processed_dataset['test'])
+            test_data = processed_dataset['test'] if not use_sft else formatted_dataset['test']
+            test_results = trainer.evaluate(test_data)
             print(f"Test results: {test_results}")
         
         return self.model, trainer
@@ -521,7 +670,12 @@ class NLPGenerationPipeline:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        self.model.save_pretrained(output_dir)
+        if self.is_peft_model:
+            # Save PEFT adapter only
+            self.model.save_pretrained(output_dir)
+        else:
+            self.model.save_pretrained(output_dir)
+        
         self.tokenizer.save_pretrained(output_dir)
         
         if self.generation_config:
@@ -534,108 +688,116 @@ if __name__ == '__main__':
     from datasets import Dataset, DatasetDict
     
     print("=" * 60)
-    print("SEQ2SEQ EXAMPLE (Text Summarization)")
+    print("PEFT + SFTTrainer EXAMPLE (Causal LM)")
     print("=" * 60)
     
     # Create dataset
     train_data = {
         'input': [
-            "The quick brown fox jumps over the lazy dog.",
-            "Machine learning is a subset of artificial intelligence.",
-            "Python is a popular programming language."
+            "What is machine learning?",
+            "Explain neural networks.",
+            "What is Python?"
         ] * 50,
         'target': [
-            "Fox jumps over dog.",
-            "ML is part of AI.",
-            "Python is popular."
+            "Machine learning is a subset of AI that enables systems to learn from data.",
+            "Neural networks are computing systems inspired by biological neural networks.",
+            "Python is a high-level programming language known for its simplicity."
         ] * 50
     }
     dataset = DatasetDict({
         'train': Dataset.from_dict(train_data),
-        'test': Dataset.from_dict({
-            'input': ["Deep learning uses neural networks."],
-            'target': ["DL uses NNs."]
+        'validation': Dataset.from_dict({
+            'input': ["What is deep learning?"],
+            'target': ["Deep learning uses multi-layered neural networks."]
         })
     })
     
-    # Train
-    pipeline = NLPGenerationPipeline(task_type='seq2seq')
-    model, trainer = pipeline.run(
-        dataset=dataset,
-        model_name='t5-small',
-        output_dir='./seq2seq_model',
-        num_epochs=3,
-        batch_size=4
+    # Train with PEFT + SFTTrainer
+    pipeline = NLPGenerationPipeline(
+        task_type='causal_lm',
+        use_peft=True,
+        peft_config={'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1}
     )
     
-    # Load and generate
-    pipeline = NLPGenerationPipeline.from_pretrained('./seq2seq_model')
-    result = pipeline.generate("Transformers have revolutionized natural language processing.")
-    print(f"\nGenerated: {result}")
-    
-    # Batch generation with multiple outputs
-    results = pipeline.generate(
-        ["AI is transforming the world.", "Climate change is a major issue."],
-        num_return_sequences=2,
-        do_sample=True,
-        temperature=0.8
-    )
-    print("\nBatch generations:")
-    for i, gens in enumerate(results):
-        print(f"  Input {i+1}:")
-        for j, gen in enumerate(gens):
-            print(f"    {j+1}. {gen}")
-    
-    print("\n" + "=" * 60)
-    print("CAUSAL LM EXAMPLE (Text Continuation)")
-    print("=" * 60)
-    
-    # Create dataset
-    lm_data = {
-        'input': [
-            "Once upon a time",
-            "In a galaxy far away",
-            "The future of technology"
-        ] * 50,
-        'target': [
-            "there was a brave knight.",
-            "there lived alien beings.",
-            "is artificial intelligence."
-        ] * 50
-    }
-    dataset = DatasetDict({'train': Dataset.from_dict(lm_data)})
-    
-    # Train
-    pipeline = NLPGenerationPipeline(task_type='causal_lm')
     model, trainer = pipeline.run(
         dataset=dataset,
         model_name='gpt2',
-        output_dir='./causal_lm_model',
-        num_epochs=3
+        output_dir='./peft_causal_lm',
+        num_epochs=3,
+        batch_size=4,
+        learning_rate=2e-4,
+        use_sft=True,
+        max_seq_length=256
     )
     
     # Generate
-    pipeline = NLPGenerationPipeline.from_pretrained('./causal_lm_model', task_type='causal_lm')
+    pipeline = NLPGenerationPipeline.from_pretrained('./peft_causal_lm', is_peft=True)
     result = pipeline.generate(
-        "The secret to happiness is",
-        max_length=50,
-        num_beams=5,
+        "What is artificial intelligence?",
+        max_length=100,
+        num_beams=4,
         early_stopping=True
     )
     print(f"\nGenerated: {result}")
     
-    # Multiple diverse outputs
-    results = pipeline.generate(
-        "The meaning of life",
-        num_return_sequences=3,
-        do_sample=True,
-        temperature=0.9,
-        top_k=50,
-        top_p=0.95
+    print("\n" + "=" * 60)
+    print("PEFT SEQ2SEQ EXAMPLE (T5 with LoRA)")
+    print("=" * 60)
+    
+    # Create summarization dataset
+    sum_data = {
+        'input': [
+            "summarize: The quick brown fox jumps over the lazy dog.",
+            "summarize: Machine learning is revolutionizing technology.",
+        ] * 50,
+        'target': [
+            "Fox jumps over dog.",
+            "ML transforms tech."
+        ] * 50
+    }
+    dataset = DatasetDict({'train': Dataset.from_dict(sum_data)})
+    
+    # Train with PEFT
+    pipeline = NLPGenerationPipeline(
+        task_type='seq2seq',
+        use_peft=True,
+        peft_config={'r': 16, 'lora_alpha': 32}
     )
-    print("\nDiverse generations:")
-    for i, gen in enumerate(results):
-        print(f"  {i+1}. {gen}")
+    
+    model, trainer = pipeline.run(
+        dataset=dataset,
+        model_name='t5-small',
+        output_dir='./peft_seq2seq',
+        num_epochs=3,
+        batch_size=4,
+        use_sft=False  # Use regular trainer for seq2seq
+    )
+    
+    # Generate
+    result = pipeline.generate(
+        "summarize: Artificial intelligence is transforming healthcare.",
+        max_length=50
+    )
+    print(f"\nGenerated: {result}")
+    
+    print("\n" + "=" * 60)
+    print("STANDARD TRAINING (No PEFT) EXAMPLE")
+    print("=" * 60)
+    
+    # Train without PEFT for comparison
+    pipeline_standard = NLPGenerationPipeline(
+        task_type='causal_lm',
+        use_peft=False  # Standard full fine-tuning
+    )
+    
+    model, trainer = pipeline_standard.run(
+        dataset=dataset,
+        model_name='gpt2',
+        output_dir='./standard_causal_lm',
+        num_epochs=2,
+        batch_size=4,
+        use_sft=False
+    )
     
     print("\n" + "=" * 60)
     print("Done!")
