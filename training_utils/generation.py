@@ -293,7 +293,6 @@ class NLPGenerationPipeline:
             fp16=fp16,
             report_to=['none'],
             predict_with_generate=True,  # Important for generation tasks
-            generation_max_length=128,
             **kwargs
         )
     
