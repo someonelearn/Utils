@@ -18,6 +18,16 @@ except Exception as e:
     SFTTrainer = None
     SFTConfig = None  # We'll raise if user tries to use it without trl
 
+# PEFT (optional)
+try:
+    from peft import get_peft_model, LoraConfig, PeftModel, TaskType as PeftTaskType, prepare_model_for_kbit_training
+except Exception:
+    get_peft_model = None
+    LoraConfig = None
+    PeftModel = None
+    PeftTaskType = None
+    prepare_model_for_kbit_training = None
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -233,13 +243,88 @@ def default_data_collator(batch: List[Dict[str, Any]], tokenizer: PreTrainedToke
     }
 
 
-def default_model_init(model_name_or_path: str, device_map: Optional[dict] = None, **kwargs):
+def default_model_init(model_name_or_path: str, device_map: Optional[dict] = None, peft_config: Optional[Union[LoraConfig, Dict[str, Any]]] = None, use_peft: bool = False, peft_adapter: Optional[str] = None, load_in_8bit: bool = False, **kwargs):
+    """
+    Loads model and tokenizer. Supports optional PEFT (LoRA) wrapping.
+
+    Args:
+        model_name_or_path: base model repo or path
+        device_map: dict for device placement (or None)
+        peft_config: either a peft.LoraConfig instance or a dict with LoraConfig params
+        use_peft: if True, will attempt to wrap the model with PEFT using peft_config
+        peft_adapter: path to an existing PEFT adapter to load with PeftModel.from_pretrained
+        load_in_8bit: whether to load model in 8-bit (requires bitsandbytes)
+        **kwargs: passed to AutoModelForCausalLM.from_pretrained
+    Returns:
+        model, tokenizer
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.sep_token or "<|pad|>"
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
-    if device_map:
-        model.to(device_map.get("device", torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+
+    model_kwargs = dict(**kwargs)
+    # allow bitsandbytes 8-bit loading
+    if load_in_8bit:
+        model_kwargs["load_in_8bit"] = True
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
+
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+
+    # optional preparation for k-bit training
+    if load_in_8bit and prepare_model_for_kbit_training is not None:
+        try:
+            prepare_model_for_kbit_training(model)
+        except Exception:
+            logger.debug("prepare_model_for_kbit_training failed or not applicable for this model")
+
+    # If user provided a path to a PEFT adapter, load it (PeftModel.from_pretrained)
+    if peft_adapter is not None and PeftModel is not None:
+        try:
+            model = PeftModel.from_pretrained(model, peft_adapter, device_map=device_map or {"device": torch.device("cuda" if torch.cuda.is_available() else "cpu")})
+            logger.info(f"Loaded PEFT adapter from {peft_adapter}")
+        except Exception as e:
+            logger.warning(f"Failed to load PEFT adapter from {peft_adapter}: {e}")
+
+    # Wrap with PEFT if requested
+    if use_peft or peft_config is not None:
+        if get_peft_model is None or LoraConfig is None or PeftModel is None:
+            raise RuntimeError("PEFT is not available. Please `pip install peft` to use PEFT/LoRA training.")
+
+        # Build LoraConfig if dict provided
+        if isinstance(peft_config, dict) or peft_config is None:
+            cfg_dict = peft_config or {}
+            # Ensure task type is set
+            task_t = PeftTaskType.CAUSAL_LM if PeftTaskType is not None else "CAUSAL_LM"
+            # Default common LoRA settings; users should pass peft_config for production
+            default_cfg = {
+                "task_type": task_t,
+                "inference_mode": False,
+                "r": cfg_dict.get("r", 8),
+                "lora_alpha": cfg_dict.get("lora_alpha", 32),
+                "lora_dropout": cfg_dict.get("lora_dropout", 0.1),
+                "target_modules": cfg_dict.get("target_modules", None),
+            }
+            # If target_modules is None, leave it; PEFT will try to find defaults
+            peft_cfg = LoraConfig(**{k: v for k, v in default_cfg.items() if v is not None})
+        elif isinstance(peft_config, LoraConfig):
+            peft_cfg = peft_config
+        else:
+            raise ValueError("peft_config must be either a dict or a LoraConfig instance")
+
+        try:
+            model = get_peft_model(model, peft_cfg)
+            logger.info("Wrapped model with PEFT (LoRA)")
+        except Exception as e:
+            raise RuntimeError(f"Failed to wrap model with PEFT: {e}")
+
+    # If device_map provided as {'device': <device>}, move model
+    if device_map and isinstance(device_map, dict) and device_map.get("device"):
+        try:
+            model.to(device_map.get("device"))
+        except Exception:
+            pass
+
     return model, tokenizer
 
 
@@ -306,10 +391,17 @@ class SFTPipelineTrainer:
         setattr(self, f"{name}_fn", fn)
 
     def _default_save(self, trainer: Any, path: str):
+        # Trainer may be a TRL trainer that has save_model, or hold a model with save_pretrained.
         if hasattr(trainer, "save_model"):
             trainer.save_model(path)
         elif hasattr(trainer, "model") and hasattr(trainer.model, "save_pretrained"):
+            # If the model is a PeftModel, save_pretrained will store adapters appropriately.
             trainer.model.save_pretrained(path)
+        elif hasattr(trainer, "model") and hasattr(trainer.model, "state_dict"):
+            # Fallback: save state dict
+            import os
+            os.makedirs(path, exist_ok=True)
+            torch.save(trainer.model.state_dict(), os.path.join(path, "pytorch_model.bin"))
         else:
             raise RuntimeError("Unable to save model: trainer has no save_model or model.save_pretrained()")
 
@@ -417,6 +509,12 @@ if __name__ == "__main__":
     # from trl import SFTConfig
     # sft_cfg = SFTConfig(...)  # configure as needed
     # pipeline = SFTPipelineTrainer(task=TaskType.PC, preprocess_fn=my_preprocess)
-    # pipeline.run(source="data.jsonl", model_name_or_path="gpt2", sft_config=sft_cfg, save_path="./out")
+    # Example enabling PEFT (LoRA):
+    # model_init_kwargs = {
+    #     "use_peft": True,
+    #     "peft_config": {"r": 8, "lora_alpha": 32, "lora_dropout": 0.1, "target_modules": ["q_proj", "v_proj"]},
+    #     "load_in_8bit": True,
+    # }
+    # pipeline.run(source="data.jsonl", model_name_or_path="facebook/opt-1.3b", sft_config=sft_cfg, model_init_kwargs=model_init_kwargs, save_path="./out")
 
     pass
