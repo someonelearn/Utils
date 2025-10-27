@@ -345,7 +345,7 @@ def default_trainer_init(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=sft_config,
         data_collator=data_collator,
         **kwargs,
@@ -516,7 +516,7 @@ class SFTPipelineTrainer:
         # 8) trainer init
         trainer_out = self.trainer_init_fn(
             model=model,
-            processing_class=tokenizer,
+            tokenizer=tokenizer,
             train_dataset=dataset_out.train_dataset,
             eval_dataset=dataset_out.eval_dataset,
             sft_config=sft_config,
