@@ -453,9 +453,14 @@ class NLPGenerationPipeline:
                               batch_size: int = 8, learning_rate: float = 5e-5,
                               eval_strategy: str = 'epoch', seed: int = 42,
                               fp16: bool = None, gradient_accumulation_steps: int = 1,
+                              gradient_checkpointing: bool = False,
                               **kwargs):
         """Create training arguments."""
         fp16 = torch.cuda.is_available() if fp16 is None else fp16
+        
+        # Disable fp16 if using 8-bit or 4-bit quantization (handled by bitsandbytes)
+        if 'bf16' in kwargs or gradient_checkpointing:
+            fp16 = False
         
         return Seq2SeqTrainingArguments(
             output_dir=output_dir,
@@ -474,9 +479,11 @@ class NLPGenerationPipeline:
             seed=seed,
             fp16=fp16,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_checkpointing=gradient_checkpointing,
+            optim="paged_adamw_8bit" if gradient_checkpointing else "adamw_torch",
             report_to=['none'],
             predict_with_generate=True,
-            generation_max_length=32,
+            generation_max_length=128,
             **kwargs
         )
     
@@ -661,7 +668,23 @@ class NLPGenerationPipeline:
         
         # Prepare model for k-bit training if using quantization
         if quantization_config and PEFT_AVAILABLE:
-            self.model = prepare_model_for_kbit_training(self.model)
+            self.model = prepare_model_for_kbit_training(
+                self.model,
+                use_gradient_checkpointing=True
+            )
+        
+        # Enable gradient checkpointing for memory efficiency
+        if use_peft or quantization_config:
+            if hasattr(self.model, 'enable_input_require_grads'):
+                self.model.enable_input_require_grads()
+            else:
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
+                self.model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+            
+            # Enable gradient checkpointing
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
         
         # Apply PEFT if requested
         if use_peft:
@@ -697,6 +720,9 @@ class NLPGenerationPipeline:
         has_eval = 'validation' in dataset or 'test' in dataset
         eval_strategy = 'epoch' if has_eval else 'no'
         
+        # Use gradient checkpointing with PEFT
+        use_gradient_checkpointing = use_peft or load_in_8bit or load_in_4bit
+        
         training_args = self.create_training_args_fn(
             output_dir=output_dir,
             num_epochs=num_epochs,
@@ -705,6 +731,7 @@ class NLPGenerationPipeline:
             eval_strategy=eval_strategy,
             seed=seed,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_checkpointing=use_gradient_checkpointing,
             **kwargs
         )
         
@@ -1024,6 +1051,28 @@ if __name__ == '__main__':
     print("Prefix Tuning: Good for few-shot learning")
     print("Prompt Tuning: Simplest, but may need more data")
     print("IA3: Very parameter efficient, good for T5 models")
+    
+    print("\n" + "=" * 60)
+    print("Troubleshooting Tips:")
+    print("=" * 60)
+    print("1. If you get 'does not require grad' error:")
+    print("   - The code now auto-enables gradient checkpointing")
+    print("   - Ensure PEFT and bitsandbytes are installed")
+    print("   - Try: pip install peft bitsandbytes accelerate")
+    print("\n2. For target_modules:")
+    print("   - T5: ['q', 'v'] or ['q', 'k', 'v', 'o']")
+    print("   - GPT-2: ['c_attn'] or ['c_attn', 'c_proj']")
+    print("   - BERT: ['query', 'value']")
+    print("   - LLaMA: ['q_proj', 'v_proj', 'k_proj', 'o_proj']")
+    print("\n3. Memory issues:")
+    print("   - Use load_in_4bit=True for QLoRA")
+    print("   - Increase gradient_accumulation_steps")
+    print("   - Reduce batch_size")
+    print("   - Use smaller lora_r value (4 or 8)")
+    print("\n4. For best results:")
+    print("   - Use higher learning rate with PEFT (1e-4 to 2e-4)")
+    print("   - lora_alpha should be ~2x lora_r")
+    print("   - Train for more epochs than full fine-tuning")
     
     print("\n" + "=" * 60)
     print("Done!")
