@@ -403,12 +403,6 @@ class FineTuningPipeline:
         
         training_args = SFTConfig(**training_args_dict)
         
-        # Determine the dataset field based on task type
-        if self.task_type == TaskType.STANDARD:
-            dataset_text_field = "text"
-        else:  # CONVERSATIONAL
-            dataset_text_field = "messages"
-        
         # Initialize SFTTrainer
         self.trainer = SFTTrainer(
             model=self.model,
@@ -416,7 +410,6 @@ class FineTuningPipeline:
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=self.tokenizer,
-            dataset_text_field=dataset_text_field,
             max_seq_length=self.data_config.max_seq_length,
             packing=self.data_config.packing,
         )
