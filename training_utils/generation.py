@@ -67,7 +67,6 @@ class DataConfig:
     input_column: str = "input"
     target_column: Optional[str] = "target"  # Only for conversational tasks
     max_seq_length: int = 512
-    dataset_text_field: str = "text"  # Column name expected by SFTTrainer
     packing: bool = False
     additional_data_kwargs: Dict[str, Any] = field(default_factory=dict)
 
