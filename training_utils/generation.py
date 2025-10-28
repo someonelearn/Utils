@@ -75,7 +75,7 @@ class FineTuningPipeline:
         print(f"Loading model: {self.config.model_name}")
         
         default_kwargs = {
-            "torch_dtype": torch.bfloat16,
+            "dtype": torch.bfloat16,
             "device_map": "auto",
         }
         default_kwargs.update(self.config.model_kwargs)
