@@ -14,7 +14,6 @@ from datasets import Dataset, DatasetDict
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainingArguments,
     PreTrainedModel,
     PreTrainedTokenizer
 )
@@ -162,7 +161,7 @@ class ModelLoader:
         """Load a pre-trained model."""
         model_kwargs = {
             "trust_remote_code": config.trust_remote_code,
-            "dtype": config.torch_dtype,
+            "torch_dtype": config.torch_dtype,
             "device_map": config.device_map,
             **config.additional_model_kwargs
         }
@@ -221,6 +220,30 @@ class PEFTConfigurator:
         model.print_trainable_parameters()
         
         return model
+    
+    @staticmethod
+    def get_peft_config(config: PEFTConfig) -> Optional[LoraConfig]:
+        """
+        Get LoraConfig object for passing to SFTTrainer.
+        
+        Args:
+            config: PEFT configuration
+            
+        Returns:
+            LoraConfig if PEFT is enabled, None otherwise
+        """
+        if not config.use_peft:
+            return None
+        
+        return LoraConfig(
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=config.target_modules,
+            bias=config.bias,
+            task_type=config.task_type,
+            **config.additional_peft_kwargs
+        )
 
 
 class DataProcessor:
@@ -338,15 +361,6 @@ class FineTuningPipeline:
         self.tokenizer = self.model_loader.load_tokenizer(self.model_config)
         print("Model and tokenizer loaded successfully.")
     
-    def apply_peft(self):
-        """Apply PEFT configuration to model."""
-        if self.peft_config.use_peft:
-            print("Applying PEFT configuration...")
-            self.model = self.peft_configurator.configure_peft(
-                self.model, self.peft_config
-            )
-            print("PEFT configuration applied.")
-    
     def prepare_dataset(
         self,
         dataset: Union[Dataset, DatasetDict]
@@ -380,8 +394,8 @@ class FineTuningPipeline:
         """
         print("Setting up trainer...")
         
-        # Prepare training arguments
-        training_args_dict = {
+        # Prepare SFTConfig arguments
+        sft_config_args = {
             "output_dir": self.training_config.output_dir,
             "num_train_epochs": self.training_config.num_train_epochs,
             "per_device_train_batch_size": self.training_config.per_device_train_batch_size,
@@ -394,25 +408,39 @@ class FineTuningPipeline:
             "save_total_limit": self.training_config.save_total_limit,
             "fp16": self.training_config.fp16,
             "optim": self.training_config.optim,
+            "max_seq_length": self.data_config.max_seq_length,
+            "packing": self.data_config.packing,
             **self.training_config.additional_training_kwargs
         }
         
         if eval_dataset is not None:
-            training_args_dict["eval_steps"] = self.training_config.eval_steps
-            training_args_dict["eval_strategy"] = "steps"
+            sft_config_args["eval_steps"] = self.training_config.eval_steps
+            sft_config_args["evaluation_strategy"] = "steps"
         
-        training_args = SFTConfig(**training_args_dict)
+        # For conversational tasks, need to specify dataset_text_field
+        if self.task_type == TaskType.STANDARD:
+            sft_config_args["dataset_text_field"] = "text"
         
-        # Initialize SFTTrainer
-        self.trainer = SFTTrainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=self.tokenizer,
-            max_seq_length=self.data_config.max_seq_length,
-            packing=self.data_config.packing,
-        )
+        training_args = SFTConfig(**sft_config_args)
+        
+        # Get PEFT config if using PEFT
+        peft_config = self.peft_configurator.get_peft_config(self.peft_config)
+        
+        # Initialize SFTTrainer with correct arguments
+        trainer_kwargs = {
+            "model": self.model,
+            "args": training_args,
+            "train_dataset": train_dataset,
+            "processing_class": self.tokenizer,  # Use processing_class instead of tokenizer
+        }
+        
+        if eval_dataset is not None:
+            trainer_kwargs["eval_dataset"] = eval_dataset
+        
+        if peft_config is not None:
+            trainer_kwargs["peft_config"] = peft_config
+        
+        self.trainer = SFTTrainer(**trainer_kwargs)
         
         print("Trainer setup complete.")
     
@@ -451,9 +479,6 @@ class FineTuningPipeline:
         """
         # Load model and tokenizer
         self.load_model_and_tokenizer()
-        
-        # Apply PEFT
-        self.apply_peft()
         
         # Prepare dataset
         formatted_dataset = self.prepare_dataset(dataset)
@@ -503,7 +528,8 @@ def example_standard_language_modeling():
     
     data_config = DataConfig(
         input_column="input",
-        max_seq_length=128
+        max_seq_length=128,
+        packing=False
     )
     
     training_config = TrainingConfig(
@@ -552,7 +578,8 @@ def example_conversational_language_modeling():
     data_config = DataConfig(
         input_column="input",
         target_column="target",
-        max_seq_length=256
+        max_seq_length=256,
+        packing=False
     )
     
     training_config = TrainingConfig(
@@ -587,7 +614,7 @@ def example_custom_formatter():
     dataset = Dataset.from_dict(data)
     
     model_config = ModelConfig(model_name="gpt2")
-    data_config = DataConfig(input_column="input")
+    data_config = DataConfig(input_column="input", packing=False)
     training_config = TrainingConfig(output_dir="./results_custom")
     
     pipeline = FineTuningPipeline(
