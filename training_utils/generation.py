@@ -316,17 +316,16 @@ class FineTuningPipeline:
         # Step 3: Preprocess dataset
         processed_dataset = self.preprocess_dataset(dataset)
         
-        # Extract train/eval splits from processed dataset
+        # Extract train/eval splits
         if isinstance(processed_dataset, DatasetDict):
             train_ds = processed_dataset.get("train")
             eval_ds = processed_dataset.get("validation") or processed_dataset.get("test")
         else:
             train_ds = processed_dataset
-            eval_ds = None
+            eval_ds = eval_dataset
         
-        # Only preprocess separate eval_dataset if provided and not already in DatasetDict
-        if eval_dataset is not None and not isinstance(dataset, DatasetDict):
-            eval_ds = self.preprocess_dataset(eval_dataset)
+        if eval_ds is not None and not isinstance(dataset, DatasetDict):
+            eval_ds = self.preprocess_dataset(eval_ds)
         
         # Step 4: Create trainer
         self.trainer = self.create_trainer(train_ds, eval_ds)
@@ -425,52 +424,7 @@ def example_conversational_lm():
     pipeline.save_model("./conversational-model")
 
 
-def example_with_datasetdict():
-    """Example: Using DatasetDict with train/validation splits"""
-    from datasets import Dataset, DatasetDict
-    
-    # Create sample datasets with splits
-    train_data = {
-        "input": [
-            "What is the capital of France?",
-            "Explain quantum computing",
-        ],
-        "target": [
-            "The capital of France is Paris.",
-            "Quantum computing uses quantum mechanics principles...",
-        ]
-    }
-    
-    val_data = {
-        "input": [
-            "How do I make pasta?",
-        ],
-        "target": [
-            "To make pasta, boil water and add pasta...",
-        ]
-    }
-    
-    dataset_dict = DatasetDict({
-        "train": Dataset.from_dict(train_data),
-        "validation": Dataset.from_dict(val_data)
-    })
-    
-    # Configure pipeline
-    config = PipelineConfig(
-        model_name="gpt2",
-        task_type="conversational",
-        input_column="input",
-        target_column="target",
-        use_peft=True,
-    )
-    
-    # Run pipeline - it will automatically use train and validation splits
-    pipeline = FineTuningPipeline(config)
-    pipeline.train(dataset_dict)
-    pipeline.save_model("./conversational-model")
-
-
 if __name__ == "__main__":
     print("Fine-tuning Pipeline Module")
     print("Import this module and use FineTuningPipeline class")
-    print("\nSee example functions for usage examples")
+    print("\nSee example_standard_lm() and example_conversational_lm() for usage examples")
