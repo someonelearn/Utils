@@ -415,7 +415,7 @@ class FineTuningPipeline:
         
         if eval_dataset is not None:
             sft_config_args["eval_steps"] = self.training_config.eval_steps
-            sft_config_args["evaluation_strategy"] = "steps"
+            sft_config_args["eval_strategy"] = "steps"
         
         # For conversational tasks, need to specify dataset_text_field
         if self.task_type == TaskType.STANDARD:
