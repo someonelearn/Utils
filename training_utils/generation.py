@@ -1,15 +1,10 @@
 """
-Modular Fine-tuning Pipeline for Language Models using Hugging Face SFTTrainer
-
-This pipeline provides a flexible, easily customizable framework for fine-tuning
-language models with PEFT support. Each component can be independently replaced
-or extended.
+Modular Pipeline for Fine-tuning Language Models with SFTTrainer
+Supports standard language modeling and conversational language modeling tasks.
 """
 
+from typing import Optional, Callable, Dict, Any, Union, List
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Callable, Union, List
-from enum import Enum
-import torch
 from datasets import Dataset, DatasetDict
 from transformers import (
     AutoModelForCausalLM,
@@ -18,441 +13,329 @@ from transformers import (
     PreTrainedTokenizer
 )
 from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftConfig, get_peft_model
+import torch
 
-
-# ============================================================================
-# TASK DEFINITIONS
-# ============================================================================
-
-class TaskType(Enum):
-    """Supported fine-tuning task types."""
-    STANDARD = "standard"  # Standard language modeling
-    CONVERSATIONAL = "conversational"  # Conversational language modeling
-
-
-# ============================================================================
-# CONFIGURATION CLASSES
-# ============================================================================
 
 @dataclass
-class ModelConfig:
-    """Configuration for model loading."""
+class PipelineConfig:
+    """Configuration for the fine-tuning pipeline."""
+    
+    # Model configuration
     model_name: str
-    trust_remote_code: bool = False
-    torch_dtype: torch.dtype = torch.float16
-    device_map: str = "auto"
-    load_in_8bit: bool = False
-    load_in_4bit: bool = False
-    additional_model_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class PEFTConfig:
-    """Configuration for PEFT (LoRA) fine-tuning."""
-    use_peft: bool = True
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
-    target_modules: Optional[List[str]] = None  # None = auto-detect
-    bias: str = "none"
-    task_type: str = "CAUSAL_LM"
-    additional_peft_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DataConfig:
-    """Configuration for data processing."""
+    
+    # Task type: "standard" or "conversational"
+    task_type: str = "standard"
+    
+    # Dataset column names
     input_column: str = "input"
-    target_column: Optional[str] = "target"  # Only for conversational tasks
-    max_seq_length: int = 512
-    packing: bool = False
-    additional_data_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class TrainingConfig:
-    """Configuration for training."""
-    output_dir: str = "./results"
-    num_train_epochs: int = 3
-    per_device_train_batch_size: int = 4
-    per_device_eval_batch_size: int = 4
-    gradient_accumulation_steps: int = 1
-    learning_rate: float = 2e-4
-    warmup_steps: int = 100
-    logging_steps: int = 10
-    save_steps: int = 500
-    eval_steps: int = 500
-    save_total_limit: int = 2
-    fp16: bool = True
-    optim: str = "paged_adamw_8bit"
-    additional_training_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-
-# ============================================================================
-# DATA FORMATTING FUNCTIONS
-# ============================================================================
-
-class DataFormatter:
-    """Handles data formatting for different task types."""
+    target_column: Optional[str] = "target"  # Only for conversational
     
-    @staticmethod
-    def format_standard(
-        example: Dict[str, Any],
-        input_column: str = "input",
-        **kwargs
-    ) -> Dict[str, str]:
+    # PEFT configuration
+    use_peft: bool = True
+    peft_config: Optional[PeftConfig] = None
+    
+    # SFT configuration
+    sft_config: Optional[SFTConfig] = None
+    
+    # Additional arguments
+    model_kwargs: Dict[str, Any] = field(default_factory=dict)
+    tokenizer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    
+    # Custom functions
+    custom_formatting_func: Optional[Callable] = None
+    custom_data_preprocessor: Optional[Callable] = None
+
+
+class FineTuningPipeline:
+    """
+    Modular pipeline for fine-tuning language models with SFTTrainer.
+    Each component can be easily customized or replaced.
+    """
+    
+    def __init__(self, config: PipelineConfig):
         """
-        Format data for standard language modeling.
+        Initialize the pipeline with configuration.
         
         Args:
-            example: Single example from dataset
-            input_column: Name of the input text column
-            
-        Returns:
-            Dictionary with 'text' key containing formatted input
+            config: PipelineConfig object containing all settings
         """
-        return {"text": example[input_column]}
-    
-    @staticmethod
-    def format_conversational(
-        example: Dict[str, Any],
-        input_column: str = "input",
-        target_column: str = "target",
-        **kwargs
-    ) -> Dict[str, List[Dict[str, str]]]:
-        """
-        Format data for conversational language modeling.
+        self.config = config
+        self.model = None
+        self.tokenizer = None
+        self.trainer = None
         
-        Args:
-            example: Single example from dataset
-            input_column: Name of the input text column
-            target_column: Name of the target text column
-            
-        Returns:
-            Dictionary with 'messages' key containing chat format
+    def load_model(self) -> PreTrainedModel:
         """
-        return {
-            "messages": [
-                {"role": "user", "content": example[input_column]},
-                {"role": "assistant", "content": example[target_column]}
-            ]
-        }
-    
-    @classmethod
-    def get_formatter(cls, task_type: TaskType) -> Callable:
-        """Get the appropriate formatter for a task type."""
-        formatters = {
-            TaskType.STANDARD: cls.format_standard,
-            TaskType.CONVERSATIONAL: cls.format_conversational
-        }
-        return formatters[task_type]
-
-
-# ============================================================================
-# PIPELINE COMPONENTS
-# ============================================================================
-
-class ModelLoader:
-    """Handles model and tokenizer loading."""
-    
-    @staticmethod
-    def load_model(config: ModelConfig) -> PreTrainedModel:
-        """Load a pre-trained model."""
-        model_kwargs = {
-            "trust_remote_code": config.trust_remote_code,
-            "torch_dtype": config.torch_dtype,
-            "device_map": config.device_map,
-            **config.additional_model_kwargs
-        }
+        Load the pre-trained model. Can be overridden for custom loading logic.
         
-        if config.load_in_8bit:
-            model_kwargs["load_in_8bit"] = True
-        if config.load_in_4bit:
-            model_kwargs["load_in_4bit"] = True
-            
+        Returns:
+            Loaded model
+        """
+        print(f"Loading model: {self.config.model_name}")
+        
+        default_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "device_map": "auto",
+        }
+        default_kwargs.update(self.config.model_kwargs)
+        
         model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            **model_kwargs
+            self.config.model_name,
+            **default_kwargs
         )
         
         return model
     
-    @staticmethod
-    def load_tokenizer(config: ModelConfig) -> PreTrainedTokenizer:
-        """Load tokenizer."""
+    def load_tokenizer(self) -> PreTrainedTokenizer:
+        """
+        Load the tokenizer. Can be overridden for custom tokenizer setup.
+        
+        Returns:
+            Loaded tokenizer
+        """
+        print(f"Loading tokenizer: {self.config.model_name}")
+        
         tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name,
-            trust_remote_code=config.trust_remote_code
+            self.config.model_name,
+            **self.config.tokenizer_kwargs
         )
         
-        # Ensure pad token is set
+        # Set padding token if not present
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             
         return tokenizer
-
-
-class PEFTConfigurator:
-    """Handles PEFT configuration and model preparation."""
     
-    @staticmethod
-    def configure_peft(model: PreTrainedModel, config: PEFTConfig) -> PreTrainedModel:
-        """Apply PEFT configuration to model."""
-        if not config.use_peft:
+    def setup_peft(self, model: PreTrainedModel) -> PreTrainedModel:
+        """
+        Apply PEFT configuration to the model. Can be customized with different PEFT methods.
+        
+        Args:
+            model: Base model to apply PEFT to
+            
+        Returns:
+            PEFT-enabled model
+        """
+        if not self.config.use_peft:
             return model
+            
+        print("Setting up PEFT...")
         
-        # Prepare model for k-bit training if using quantization
-        model = prepare_model_for_kbit_training(model)
-        
-        # Configure LoRA
-        peft_config = LoraConfig(
-            r=config.lora_r,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            target_modules=config.target_modules,
-            bias=config.bias,
-            task_type=config.task_type,
-            **config.additional_peft_kwargs
-        )
-        
+        # Default LoRA configuration if none provided
+        if self.config.peft_config is None:
+            peft_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+            )
+        else:
+            peft_config = self.config.peft_config
+            
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
         
         return model
     
-    @staticmethod
-    def get_peft_config(config: PEFTConfig) -> Optional[LoraConfig]:
-        """
-        Get LoraConfig object for passing to SFTTrainer.
-        
-        Args:
-            config: PEFT configuration
-            
-        Returns:
-            LoraConfig if PEFT is enabled, None otherwise
-        """
-        if not config.use_peft:
-            return None
-        
-        return LoraConfig(
-            r=config.lora_r,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            target_modules=config.target_modules,
-            bias=config.bias,
-            task_type=config.task_type,
-            **config.additional_peft_kwargs
-        )
-
-
-class DataProcessor:
-    """Handles dataset processing and formatting."""
-    
-    @staticmethod
-    def process_dataset(
-        dataset: Union[Dataset, DatasetDict],
-        task_type: TaskType,
-        data_config: DataConfig,
-        custom_formatter: Optional[Callable] = None
-    ) -> Union[Dataset, DatasetDict]:
-        """
-        Process dataset by applying formatting function.
-        
-        Args:
-            dataset: Input dataset
-            task_type: Type of task (standard or conversational)
-            data_config: Data configuration
-            custom_formatter: Optional custom formatting function
-            
-        Returns:
-            Formatted dataset
-        """
-        # Use custom formatter if provided, otherwise use default
-        if custom_formatter is not None:
-            formatter = custom_formatter
-        else:
-            formatter = DataFormatter.get_formatter(task_type)
-        
-        # Prepare formatter arguments
-        formatter_kwargs = {
-            "input_column": data_config.input_column,
-            **data_config.additional_data_kwargs
-        }
-        
-        if task_type == TaskType.CONVERSATIONAL:
-            formatter_kwargs["target_column"] = data_config.target_column
-        
-        # Apply formatting
-        def format_fn(example):
-            return formatter(example, **formatter_kwargs)
-        
-        formatted_dataset = dataset.map(
-            format_fn,
-            remove_columns=dataset.column_names if isinstance(dataset, Dataset) 
-                          else dataset['train'].column_names
-        )
-        
-        return formatted_dataset
-
-
-# ============================================================================
-# MAIN PIPELINE
-# ============================================================================
-
-class FineTuningPipeline:
-    """
-    Modular pipeline for fine-tuning language models.
-    
-    Each component can be replaced with custom implementations:
-    - model_loader: Custom model loading logic
-    - peft_configurator: Custom PEFT configuration
-    - data_processor: Custom data processing
-    - data_formatter: Custom data formatting function
-    """
-    
-    def __init__(
-        self,
-        task_type: TaskType,
-        model_config: ModelConfig,
-        data_config: DataConfig,
-        training_config: TrainingConfig,
-        peft_config: Optional[PEFTConfig] = None,
-        model_loader: Optional[ModelLoader] = None,
-        peft_configurator: Optional[PEFTConfigurator] = None,
-        data_processor: Optional[DataProcessor] = None,
-        custom_data_formatter: Optional[Callable] = None
-    ):
-        """
-        Initialize the fine-tuning pipeline.
-        
-        Args:
-            task_type: Type of task (STANDARD or CONVERSATIONAL)
-            model_config: Model configuration
-            data_config: Data configuration
-            training_config: Training configuration
-            peft_config: PEFT configuration (optional)
-            model_loader: Custom model loader (optional)
-            peft_configurator: Custom PEFT configurator (optional)
-            data_processor: Custom data processor (optional)
-            custom_data_formatter: Custom data formatting function (optional)
-        """
-        self.task_type = task_type
-        self.model_config = model_config
-        self.data_config = data_config
-        self.training_config = training_config
-        self.peft_config = peft_config or PEFTConfig()
-        
-        # Use custom components if provided, otherwise use defaults
-        self.model_loader = model_loader or ModelLoader()
-        self.peft_configurator = peft_configurator or PEFTConfigurator()
-        self.data_processor = data_processor or DataProcessor()
-        self.custom_data_formatter = custom_data_formatter
-        
-        # Initialize components
-        self.model = None
-        self.tokenizer = None
-        self.trainer = None
-    
-    def load_model_and_tokenizer(self):
-        """Load model and tokenizer."""
-        print("Loading model and tokenizer...")
-        self.model = self.model_loader.load_model(self.model_config)
-        self.tokenizer = self.model_loader.load_tokenizer(self.model_config)
-        print("Model and tokenizer loaded successfully.")
-    
-    def prepare_dataset(
-        self,
+    def preprocess_dataset(
+        self, 
         dataset: Union[Dataset, DatasetDict]
     ) -> Union[Dataset, DatasetDict]:
         """
-        Prepare dataset for training.
+        Preprocess the dataset. Can be overridden for custom preprocessing.
         
         Args:
-            dataset: Input dataset with required columns
+            dataset: Input dataset
             
         Returns:
-            Formatted dataset ready for SFTTrainer
+            Preprocessed dataset
         """
-        print("Processing dataset...")
-        formatted_dataset = self.data_processor.process_dataset(
-            dataset=dataset,
-            task_type=self.task_type,
-            data_config=self.data_config,
-            custom_formatter=self.custom_data_formatter
-        )
-        print("Dataset processed successfully.")
-        return formatted_dataset
+        if self.config.custom_data_preprocessor:
+            print("Applying custom data preprocessor...")
+            return self.config.custom_data_preprocessor(dataset)
+        
+        # Default preprocessing based on task type
+        if self.config.task_type == "standard":
+            return self._preprocess_standard(dataset)
+        elif self.config.task_type == "conversational":
+            return self._preprocess_conversational(dataset)
+        else:
+            raise ValueError(f"Unknown task type: {self.config.task_type}")
     
-    def setup_trainer(self, train_dataset: Dataset, eval_dataset: Optional[Dataset] = None):
+    def _preprocess_standard(
+        self, 
+        dataset: Union[Dataset, DatasetDict]
+    ) -> Union[Dataset, DatasetDict]:
         """
-        Set up the SFTTrainer.
+        Preprocess dataset for standard language modeling.
+        Converts input column to 'text' field.
+        """
+        print("Preprocessing for standard language modeling...")
+        
+        def format_example(example):
+            return {"text": example[self.config.input_column]}
+        
+        if isinstance(dataset, DatasetDict):
+            return DatasetDict({
+                split: ds.map(format_example, remove_columns=ds.column_names)
+                for split, ds in dataset.items()
+            })
+        else:
+            return dataset.map(format_example, remove_columns=dataset.column_names)
+    
+    def _preprocess_conversational(
+        self, 
+        dataset: Union[Dataset, DatasetDict]
+    ) -> Union[Dataset, DatasetDict]:
+        """
+        Preprocess dataset for conversational language modeling.
+        Converts input and target columns to 'messages' format.
+        """
+        print("Preprocessing for conversational language modeling...")
+        
+        def format_example(example):
+            messages = [
+                {"role": "user", "content": example[self.config.input_column]},
+                {"role": "assistant", "content": example[self.config.target_column]}
+            ]
+            return {"messages": messages}
+        
+        if isinstance(dataset, DatasetDict):
+            return DatasetDict({
+                split: ds.map(format_example, remove_columns=ds.column_names)
+                for split, ds in dataset.items()
+            })
+        else:
+            return dataset.map(format_example, remove_columns=dataset.column_names)
+    
+    def get_formatting_func(self) -> Optional[Callable]:
+        """
+        Get the formatting function for SFTTrainer.
+        Returns custom function if provided, otherwise None (SFTTrainer uses default).
+        """
+        if self.config.custom_formatting_func:
+            print("Using custom formatting function...")
+            return self.config.custom_formatting_func
+        
+        # SFTTrainer handles standard formats automatically
+        return None
+    
+    def create_sft_config(self) -> SFTConfig:
+        """
+        Create SFTConfig. Can be overridden for custom configuration.
+        
+        Returns:
+            SFTConfig object
+        """
+        if self.config.sft_config:
+            return self.config.sft_config
+        
+        print("Creating default SFTConfig...")
+        
+        # Default configuration
+        return SFTConfig(
+            output_dir="./results",
+            num_train_epochs=3,
+            per_device_train_batch_size=4,
+            per_device_eval_batch_size=4,
+            gradient_accumulation_steps=4,
+            learning_rate=2e-4,
+            warmup_steps=100,
+            logging_steps=10,
+            save_steps=100,
+            eval_strategy="steps",
+            eval_steps=100,
+            save_total_limit=2,
+            load_best_model_at_end=True,
+            max_length=512,
+            packing=False,
+            dataset_text_field="text" if self.config.task_type == "standard" else None,
+            gradient_checkpointing=True,
+            bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+            fp16=False,
+        )
+    
+    def create_trainer(
+        self, 
+        train_dataset: Dataset,
+        eval_dataset: Optional[Dataset] = None
+    ) -> SFTTrainer:
+        """
+        Create the SFTTrainer. Can be overridden for custom trainer setup.
         
         Args:
             train_dataset: Training dataset
-            eval_dataset: Evaluation dataset (optional)
+            eval_dataset: Optional evaluation dataset
+            
+        Returns:
+            Configured SFTTrainer
         """
-        print("Setting up trainer...")
+        print("Creating SFTTrainer...")
         
-        # Prepare SFTConfig arguments
-        sft_config_args = {
-            "output_dir": self.training_config.output_dir,
-            "num_train_epochs": self.training_config.num_train_epochs,
-            "per_device_train_batch_size": self.training_config.per_device_train_batch_size,
-            "per_device_eval_batch_size": self.training_config.per_device_eval_batch_size,
-            "gradient_accumulation_steps": self.training_config.gradient_accumulation_steps,
-            "learning_rate": self.training_config.learning_rate,
-            "warmup_steps": self.training_config.warmup_steps,
-            "logging_steps": self.training_config.logging_steps,
-            "save_steps": self.training_config.save_steps,
-            "save_total_limit": self.training_config.save_total_limit,
-            "fp16": self.training_config.fp16,
-            "optim": self.training_config.optim,
-            "max_seq_length": self.data_config.max_seq_length,
-            "packing": self.data_config.packing,
-            **self.training_config.additional_training_kwargs
-        }
+        sft_config = self.create_sft_config()
+        formatting_func = self.get_formatting_func()
         
-        if eval_dataset is not None:
-            sft_config_args["eval_steps"] = self.training_config.eval_steps
-            sft_config_args["eval_strategy"] = "steps"
+        trainer = SFTTrainer(
+            model=self.model,
+            args=sft_config,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=self.tokenizer,
+            peft_config=self.config.peft_config if self.config.use_peft else None,
+            formatting_func=formatting_func,
+        )
         
-        # For conversational tasks, need to specify dataset_text_field
-        if self.task_type == TaskType.STANDARD:
-            sft_config_args["dataset_text_field"] = "text"
-        
-        training_args = SFTConfig(**sft_config_args)
-        
-        # Get PEFT config if using PEFT
-        peft_config = self.peft_configurator.get_peft_config(self.peft_config)
-        
-        # Initialize SFTTrainer with correct arguments
-        trainer_kwargs = {
-            "model": self.model,
-            "args": training_args,
-            "train_dataset": train_dataset,
-            "processing_class": self.tokenizer,  # Use processing_class instead of tokenizer
-        }
-        
-        if eval_dataset is not None:
-            trainer_kwargs["eval_dataset"] = eval_dataset
-        
-        if peft_config is not None:
-            trainer_kwargs["peft_config"] = peft_config
-        
-        self.trainer = SFTTrainer(**trainer_kwargs)
-        
-        print("Trainer setup complete.")
+        return trainer
     
-    def train(self):
-        """Execute training."""
-        if self.trainer is None:
-            raise RuntimeError("Trainer not set up. Call setup_trainer() first.")
+    def train(
+        self, 
+        dataset: Union[Dataset, DatasetDict],
+        eval_dataset: Optional[Dataset] = None
+    ):
+        """
+        Main training pipeline. Orchestrates all steps.
         
-        print("Starting training...")
+        Args:
+            dataset: Training dataset (or DatasetDict with 'train' split)
+            eval_dataset: Optional evaluation dataset
+        """
+        print("=" * 50)
+        print("Starting Fine-tuning Pipeline")
+        print("=" * 50)
+        
+        # Step 1: Load model and tokenizer
+        self.model = self.load_model()
+        self.tokenizer = self.load_tokenizer()
+        
+        # Step 2: Setup PEFT
+        self.model = self.setup_peft(self.model)
+        
+        # Step 3: Preprocess dataset
+        processed_dataset = self.preprocess_dataset(dataset)
+        
+        # Extract train/eval splits
+        if isinstance(processed_dataset, DatasetDict):
+            train_ds = processed_dataset.get("train")
+            eval_ds = processed_dataset.get("validation") or processed_dataset.get("test")
+        else:
+            train_ds = processed_dataset
+            eval_ds = eval_dataset
+        
+        if eval_ds is not None:
+            eval_ds = self.preprocess_dataset(eval_ds)
+        
+        # Step 4: Create trainer
+        self.trainer = self.create_trainer(train_ds, eval_ds)
+        
+        # Step 5: Train
+        print("\nStarting training...")
         self.trainer.train()
-        print("Training complete.")
-    
+        
+        print("\nTraining completed!")
+        
     def save_model(self, output_path: str):
         """
         Save the fine-tuned model.
@@ -460,178 +343,88 @@ class FineTuningPipeline:
         Args:
             output_path: Path to save the model
         """
+        if self.trainer is None:
+            raise ValueError("No trainer found. Run train() first.")
+        
         print(f"Saving model to {output_path}...")
         self.trainer.save_model(output_path)
         self.tokenizer.save_pretrained(output_path)
-        print("Model saved successfully.")
-    
-    def run(
-        self,
-        dataset: Union[Dataset, DatasetDict],
-        output_path: Optional[str] = None
-    ):
-        """
-        Run the complete fine-tuning pipeline.
-        
-        Args:
-            dataset: Input dataset
-            output_path: Path to save the final model (optional)
-        """
-        # Load model and tokenizer
-        self.load_model_and_tokenizer()
-        
-        # Prepare dataset
-        formatted_dataset = self.prepare_dataset(dataset)
-        
-        # Split dataset if it's a DatasetDict
-        if isinstance(formatted_dataset, DatasetDict):
-            train_dataset = formatted_dataset.get('train')
-            eval_dataset = formatted_dataset.get('validation') or formatted_dataset.get('test')
-        else:
-            train_dataset = formatted_dataset
-            eval_dataset = None
-        
-        # Setup trainer
-        self.setup_trainer(train_dataset, eval_dataset)
-        
-        # Train
-        self.train()
-        
-        # Save model
-        if output_path:
-            self.save_model(output_path)
+        print("Model saved successfully!")
 
 
-# ============================================================================
-# USAGE EXAMPLES
-# ============================================================================
-
-def example_standard_language_modeling():
-    """Example: Standard language modeling task."""
+# Example usage functions
+def example_standard_lm():
+    """Example: Standard language modeling"""
     from datasets import Dataset
     
-    # Create example dataset
+    # Create sample dataset
     data = {
         "input": [
-            "The capital of France is",
-            "Python is a programming language that",
-            "Machine learning is"
+            "The quick brown fox",
+            "Machine learning is",
+            "Python programming"
         ]
     }
     dataset = Dataset.from_dict(data)
     
     # Configure pipeline
-    model_config = ModelConfig(
+    config = PipelineConfig(
         model_name="gpt2",
-        load_in_8bit=False
-    )
-    
-    data_config = DataConfig(
+        task_type="standard",
         input_column="input",
-        max_seq_length=128,
-        packing=False
-    )
-    
-    training_config = TrainingConfig(
-        output_dir="./results_standard",
-        num_train_epochs=1,
-        per_device_train_batch_size=2
-    )
-    
-    peft_config = PEFTConfig(
         use_peft=True,
-        lora_r=8
     )
     
-    # Create and run pipeline
-    pipeline = FineTuningPipeline(
-        task_type=TaskType.STANDARD,
-        model_config=model_config,
-        data_config=data_config,
-        training_config=training_config,
-        peft_config=peft_config
-    )
-    
-    pipeline.run(dataset, output_path="./fine_tuned_model")
+    # Run pipeline
+    pipeline = FineTuningPipeline(config)
+    pipeline.train(dataset)
+    pipeline.save_model("./fine-tuned-model")
 
 
-def example_conversational_language_modeling():
-    """Example: Conversational language modeling task."""
+def example_conversational_lm():
+    """Example: Conversational language modeling"""
     from datasets import Dataset
     
-    # Create example dataset
+    # Create sample dataset
     data = {
-        "input": ["What is AI?", "Explain neural networks"],
+        "input": [
+            "What is the capital of France?",
+            "Explain quantum computing",
+            "How do I make pasta?"
+        ],
         "target": [
-            "AI stands for Artificial Intelligence...",
-            "Neural networks are computing systems..."
+            "The capital of France is Paris.",
+            "Quantum computing uses quantum mechanics principles...",
+            "To make pasta, boil water and add pasta..."
         ]
     }
     dataset = Dataset.from_dict(data)
     
-    # Configure pipeline
-    model_config = ModelConfig(
-        model_name="gpt2",
-        load_in_8bit=False
+    # Configure pipeline with custom PEFT config
+    custom_peft = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.1,
+        bias="none",
+        task_type="CAUSAL_LM"
     )
     
-    data_config = DataConfig(
+    config = PipelineConfig(
+        model_name="gpt2",
+        task_type="conversational",
         input_column="input",
         target_column="target",
-        max_seq_length=256,
-        packing=False
+        use_peft=True,
+        peft_config=custom_peft,
     )
     
-    training_config = TrainingConfig(
-        output_dir="./results_conversational",
-        num_train_epochs=1,
-        per_device_train_batch_size=2
-    )
-    
-    peft_config = PEFTConfig(use_peft=True)
-    
-    # Create and run pipeline
-    pipeline = FineTuningPipeline(
-        task_type=TaskType.CONVERSATIONAL,
-        model_config=model_config,
-        data_config=data_config,
-        training_config=training_config,
-        peft_config=peft_config
-    )
-    
-    pipeline.run(dataset, output_path="./fine_tuned_conversational_model")
-
-
-def example_custom_formatter():
-    """Example: Using a custom data formatter."""
-    from datasets import Dataset
-    
-    def custom_formatter(example, input_column="input", **kwargs):
-        """Custom formatter that adds a prefix."""
-        return {"text": f"Question: {example[input_column]}"}
-    
-    data = {"input": ["What is Python?", "Explain AI"]}
-    dataset = Dataset.from_dict(data)
-    
-    model_config = ModelConfig(model_name="gpt2")
-    data_config = DataConfig(input_column="input", packing=False)
-    training_config = TrainingConfig(output_dir="./results_custom")
-    
-    pipeline = FineTuningPipeline(
-        task_type=TaskType.STANDARD,
-        model_config=model_config,
-        data_config=data_config,
-        training_config=training_config,
-        custom_data_formatter=custom_formatter
-    )
-    
-    pipeline.run(dataset)
+    # Run pipeline
+    pipeline = FineTuningPipeline(config)
+    pipeline.train(dataset)
+    pipeline.save_model("./conversational-model")
 
 
 if __name__ == "__main__":
-    print("Fine-tuning Pipeline Examples")
-    print("=" * 50)
-    print("\nUncomment the example you want to run:\n")
-    # example_standard_language_modeling()
-    # example_conversational_language_modeling()
-    # example_custom_formatter()
+    print("Fine-tuning Pipeline Module")
+    print("Import this module and use FineTuningPipeline class")
+    print("\nSee example_standard_lm() and example_conversational_lm() for usage examples")
