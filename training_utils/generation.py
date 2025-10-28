@@ -400,7 +400,7 @@ class FineTuningPipeline:
         
         if eval_dataset is not None:
             training_args_dict["eval_steps"] = self.training_config.eval_steps
-            training_args_dict["evaluation_strategy"] = "steps"
+            training_args_dict["eval_strategy"] = "steps"
         
         training_args = SFTConfig(**training_args_dict)
         
