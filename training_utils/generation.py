@@ -163,7 +163,7 @@ class ModelLoader:
         """Load a pre-trained model."""
         model_kwargs = {
             "trust_remote_code": config.trust_remote_code,
-            "torch_dtype": config.torch_dtype,
+            "dtype": config.torch_dtype,
             "device_map": config.device_map,
             **config.additional_model_kwargs
         }
