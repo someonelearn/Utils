@@ -416,7 +416,7 @@ class FineTuningPipeline:
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=self.tokenizer,
+            processing_class=self.tokenizer,
             dataset_text_field=dataset_text_field,
             max_seq_length=self.data_config.max_seq_length,
             packing=self.data_config.packing,
