@@ -179,10 +179,13 @@ class FineTuningPipeline:
             return {"text": example[self.config.input_column]}
         
         if isinstance(dataset, DatasetDict):
-            return DatasetDict({
-                split: ds.map(format_example, remove_columns=ds.column_names)
-                for split, ds in dataset.items()
-            })
+            processed = {}
+            for split, ds in dataset.items():
+                processed[split] = ds.map(
+                    format_example, 
+                    remove_columns=ds.column_names
+                )
+            return DatasetDict(processed)
         else:
             return dataset.map(format_example, remove_columns=dataset.column_names)
     
@@ -204,10 +207,13 @@ class FineTuningPipeline:
             return {"messages": messages}
         
         if isinstance(dataset, DatasetDict):
-            return DatasetDict({
-                split: ds.map(format_example, remove_columns=ds.column_names)
-                for split, ds in dataset.items()
-            })
+            processed = {}
+            for split, ds in dataset.items():
+                processed[split] = ds.map(
+                    format_example, 
+                    remove_columns=ds.column_names
+                )
+            return DatasetDict(processed)
         else:
             return dataset.map(format_example, remove_columns=dataset.column_names)
     
